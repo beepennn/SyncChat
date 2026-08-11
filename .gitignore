@@ -1,0 +1,22 @@
+# Compiled binaries
+bin/*
+*.o
+
+# Runtime logs
+logs/*
+!logs/.gitkeep
+
+# Uploaded files
+storage/*
+!storage/.gitkeep
+
+# Debug files
+core
+core.*
+
+# Editor files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
