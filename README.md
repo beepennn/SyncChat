@@ -1,59 +1,4 @@
-Got it. We'll finish **only this milestone now**:
 
-1. Add a proper `README.md`.
-2. Set the GitHub repository description/topics shown in your screenshot.
-3. Commit and push everything.
-4. Verify the GitHub repository.
-5. Stop here for today. We will **not start the username/broadcast milestone** yet.
-
-## 1. GitHub repository description
-
-In the GitHub dialog shown in your screenshot, I recommend:
-
-**Description**
-
-```text
-A Linux-based multi-client chat and file sharing system implemented in C using TCP sockets, POSIX threads, mutex synchronization, Unix-domain IPC, and a custom syslog-like logging daemon.
-```
-
-**Website**
-
-Leave it empty for now.
-
-**Topics**
-
-Use:
-
-```text
-network-programming
-systems-programming
-c
-socket-programming
-tcp
-pthread
-concurrency
-ipc
-unix-domain-sockets
-file-sharing
-linux
-```
-
-You do not need to add a deployment. Keep the repository focused on the source project.
-
----
-
-# 2. Create the README
-
-Use `vim`:
-
-```bash
-cd ~/SyncChat
-vim README.md
-```
-
-Replace the entire file with:
-
-````markdown
 # SyncChat
 
 **SyncChat: A Scalable Multi-Client Chat and File Sharing Server**
@@ -390,5 +335,3 @@ The networking foundation, concurrent client handling, thread-safe client regist
 **Bipin Lamsal**
 
 GitHub: [@beepennn](https://github.com/beepennn)
-
-````
