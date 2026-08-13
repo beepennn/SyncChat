@@ -1,3 +1,4 @@
+
 # Compiled binaries
 bin/*
 *.o
@@ -20,3 +21,8 @@ core.*
 
 # OS files
 .DS_Store
+
+# Vim swap and backup files
+*.swp
+*.swo
+*~
