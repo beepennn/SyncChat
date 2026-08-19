@@ -25,4 +25,10 @@ core.*
 # Vim swap and backup files
 *.swp
 *.swo
+*
+
+# Vim temporary files
+*.swp
+*.swo
 *~
+~
