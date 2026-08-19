@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "common/network_io.h"
@@ -13,15 +14,15 @@
 
 
 /*
- * Send one length-prefixed application message.
+ * Raw framed send.
  *
- * Wire format:
+ * This function is used only during the login phase,
+ * before the client has been registered in the shared
+ * client manager.
  *
- * +----------------------+----------------------+
- * | Type (4 bytes)       | Length (4 bytes)     |
- * +----------------------+----------------------+
- * | Payload (N bytes)                           |
- * +---------------------------------------------+
+ * After successful registration, all outgoing server
+ * messages must use client_manager_send() so that
+ * writes to each TCP stream are serialized.
  */
 static int send_message(
     int socket_fd,
@@ -37,19 +38,20 @@ static int send_message(
         return -1;
     }
 
+    if (!is_valid_message_type(type))
+    {
+        return -1;
+    }
+
     payload_length = strlen(payload);
 
     if (payload_length > MESSAGE_MAX_SIZE)
     {
-        fprintf(
-            stderr,
-            "Message exceeds maximum size.\n"
-        );
-
         return -1;
     }
 
     header.type = htonl(type);
+
     header.length = htonl(
         (uint32_t)payload_length
     );
@@ -68,21 +70,27 @@ static int send_message(
         return 0;
     }
 
-    return send_all(
-        socket_fd,
-        payload,
-        payload_length
-    );
+    if (send_all(
+            socket_fd,
+            payload,
+            payload_length
+        ) != 0)
+    {
+        return -1;
+    }
+
+    return 0;
 }
 
 
 /*
- * Receive one length-prefixed application message.
+ * Receive one complete framed application message.
  *
- * Return:
- *   0  success
- *   1  peer disconnected
- *  -1  error
+ * Return values:
+ *
+ *   0  complete message received
+ *   1  peer closed the connection
+ *  -1  protocol/socket error
  */
 static int receive_message(
     int socket_fd,
@@ -123,7 +131,7 @@ static int receive_message(
     {
         fprintf(
             stderr,
-            "Invalid message type: %u\n",
+            "Client sent invalid message type: %u\n",
             type
         );
 
@@ -134,21 +142,18 @@ static int receive_message(
     {
         fprintf(
             stderr,
-            "Message exceeds maximum size: %u\n",
+            "Client sent oversized payload: %u bytes\n",
             length
         );
 
         return -1;
     }
 
-    /*
-     * One extra byte is required for '\0'.
-     */
     if ((size_t)length >= payload_size)
     {
         fprintf(
             stderr,
-            "Payload buffer is too small.\n"
+            "Client payload buffer is too small.\n"
         );
 
         return -1;
@@ -177,13 +182,19 @@ static int receive_message(
 
 
 /*
- * Receive and validate the initial login request.
+ * Perform the initial username/login handshake.
+ *
+ * Login-phase messages use send_message() because the
+ * client has not yet been entered into the registry.
+ *
+ * Once client_manager_add() succeeds, every subsequent
+ * server write goes through client_manager_send().
  *
  * Return:
- *   0  valid login packet
- *   1  peer disconnected
- *   2  invalid username
- *  -1  protocol/communication error
+ *
+ *   >0  assigned client ID
+ *    0  login rejected
+ *   -1  connection/internal error
  */
 static int perform_login(
     int socket_fd,
@@ -191,80 +202,20 @@ static int perform_login(
     size_t username_size
 )
 {
+    char payload[MESSAGE_MAX_SIZE + 1];
+
     uint32_t message_type;
 
-    int result = receive_message(
-        socket_fd,
-        &message_type,
-        username,
-        username_size
-    );
+    int result;
 
-    if (result == 1)
-    {
-        return 1;
-    }
-
-    if (result < 0)
+    if (username == NULL ||
+        username_size < USERNAME_MAX_SIZE)
     {
         return -1;
     }
 
-    if (message_type != MSG_LOGIN)
-    {
-        fprintf(
-            stderr,
-            "Expected MSG_LOGIN, received type %u.\n",
-            message_type
-        );
-
-        return -1;
-    }
-
-    if (!is_valid_username(username))
-    {
-        return 2;
-    }
-
-    return 0;
-}
-
-
-/*
- * Handle a single connected client.
- *
- * Ownership of socket_fd is transferred to this thread.
- */
-void *client_handler(void *argument)
-{
-    client_context_t *context = argument;
-
-    if (context == NULL)
-    {
-        return NULL;
-    }
-
     /*
-     * Copy the socket descriptor before releasing
-     * the dynamically allocated context.
-     */
-    int socket_fd = context->socket_fd;
-
-    free(context);
-    context = NULL;
-
-    pthread_t thread_id = pthread_self();
-
-    int client_id = -1;
-    int remove_result = -1;
-
-    printf(
-        "Client thread [%lu] started.\n",
-        (unsigned long)thread_id
-    );
-
-    /*
-     * Ask the client for a username.
+     * Ask the newly connected client for a username.
      */
     if (send_message(
             socket_fd,
@@ -274,19 +225,185 @@ void *client_handler(void *argument)
     {
         fprintf(
             stderr,
-            "Thread [%lu]: failed to send login request.\n",
-            (unsigned long)thread_id
+            "Failed to request username from client.\n"
         );
 
-        close(socket_fd);
-
-        return NULL;
+        return -1;
     }
 
     /*
-     * Receive username.
+     * Receive LOGIN request.
      */
+    result = receive_message(
+        socket_fd,
+        &message_type,
+        payload,
+        sizeof(payload)
+    );
+
+    if (result == 1)
+    {
+        return -1;
+    }
+
+    if (result < 0)
+    {
+        fprintf(
+            stderr,
+            "Failed to receive login request.\n"
+        );
+
+        return -1;
+    }
+
+    if (message_type != MSG_LOGIN)
+    {
+        send_message(
+            socket_fd,
+            MSG_ERROR,
+            "LOGIN_REQUIRED"
+        );
+
+        return 0;
+    }
+
+    if (!is_valid_username(payload))
+    {
+        send_message(
+            socket_fd,
+            MSG_ERROR,
+            "INVALID_USERNAME"
+        );
+
+        return 0;
+    }
+
+    strncpy(
+        username,
+        payload,
+        username_size - 1
+    );
+
+    username[
+        username_size - 1
+    ] = '\0';
+
+    /*
+     * Username uniqueness checking and registry
+     * insertion are performed atomically inside
+     * client_manager_add().
+     */
+    int client_id = client_manager_add(
+        socket_fd,
+        pthread_self(),
+        username
+    );
+
+    if (client_id == -2)
+    {
+        send_message(
+            socket_fd,
+            MSG_ERROR,
+            "USERNAME_ALREADY_EXISTS"
+        );
+
+        return 0;
+    }
+
+    if (client_id < 0)
+    {
+        send_message(
+            socket_fd,
+            MSG_ERROR,
+            "SERVER_CLIENT_LIMIT"
+        );
+
+        return -1;
+    }
+
+    /*
+     * The client is registered from this point onward.
+     *
+     * Therefore LOGIN_SUCCESS must use the serialized
+     * client_manager_send() path.
+     */
+    char response[USERNAME_MAX_SIZE + 32];
+
+    int written = snprintf(
+        response,
+        sizeof(response),
+        "LOGIN_SUCCESS %s",
+        username
+    );
+
+    if (written < 0 ||
+        (size_t)written >= sizeof(response))
+    {
+        client_manager_remove(socket_fd);
+
+        return -1;
+    }
+
+    if (client_manager_send(
+            socket_fd,
+            MSG_RESPONSE,
+            response
+        ) != 0)
+    {
+        fprintf(
+            stderr,
+            "Client %d: failed to send login success response.\n",
+            client_id
+        );
+
+        client_manager_remove(socket_fd);
+
+        return -1;
+    }
+
+    return client_id;
+}
+
+
+void *client_handler(void *argument)
+{
+    client_context_t *context =
+        (client_context_t *)argument;
+
+    int socket_fd;
+
+    int client_id = 0;
+
+    int client_registered = 0;
+
     char username[USERNAME_MAX_SIZE];
+
+    char payload[MESSAGE_MAX_SIZE + 1];
+
+    uint32_t message_type;
+
+    int remove_result;
+
+
+    if (context == NULL)
+    {
+        return NULL;
+    }
+
+    socket_fd = context->socket_fd;
+
+    /*
+     * Ownership of the dynamically allocated context
+     * belongs to this client thread.
+     */
+    free(context);
+
+
+    printf(
+        "Client thread [%lu] started.\n",
+        (unsigned long)pthread_self()
+    );
+
 
     memset(
         username,
@@ -294,144 +411,30 @@ void *client_handler(void *argument)
         sizeof(username)
     );
 
-    int login_result = perform_login(
+
+    /*
+     * LOGIN PHASE
+     */
+    client_id = perform_login(
         socket_fd,
         username,
         sizeof(username)
     );
 
-    if (login_result == 1)
+    if (client_id <= 0)
     {
-        printf(
-            "Thread [%lu]: client disconnected during login.\n",
-            (unsigned long)thread_id
-        );
-
-        close(socket_fd);
-
-        return NULL;
-    }
-
-    if (login_result == 2)
-    {
-        if (send_message(
-                socket_fd,
-                MSG_ERROR,
-                "INVALID_USERNAME"
-            ) != 0)
-        {
-            fprintf(
-                stderr,
-                "Thread [%lu]: failed to send invalid-username response.\n",
-                (unsigned long)thread_id
-            );
-        }
-
         close(socket_fd);
 
         printf(
-            "Thread [%lu]: invalid username rejected.\n",
-            (unsigned long)thread_id
+            "Client thread [%lu] terminated.\n",
+            (unsigned long)pthread_self()
         );
 
         return NULL;
     }
 
-    if (login_result != 0)
-    {
-        if (send_message(
-                socket_fd,
-                MSG_ERROR,
-                "LOGIN_FAILED"
-            ) != 0)
-        {
-            fprintf(
-                stderr,
-                "Thread [%lu]: failed to send login failure response.\n",
-                (unsigned long)thread_id
-            );
-        }
+    client_registered = 1;
 
-        close(socket_fd);
-
-        printf(
-            "Thread [%lu]: login failed.\n",
-            (unsigned long)thread_id
-        );
-
-        return NULL;
-    }
-
-    /*
-     * Register the client.
-     *
-     * Username uniqueness is checked and insertion is
-     * performed inside the same mutex-protected operation
-     * in client_manager_add().
-     */
-    client_id = client_manager_add(
-        socket_fd,
-        thread_id,
-        username
-    );
-
-    /*
-     * -2 means duplicate username.
-     */
-    if (client_id == -2)
-    {
-        if (send_message(
-                socket_fd,
-                MSG_ERROR,
-                "USERNAME_ALREADY_EXISTS"
-            ) != 0)
-        {
-            fprintf(
-                stderr,
-                "Thread [%lu]: failed to send duplicate-username response.\n",
-                (unsigned long)thread_id
-            );
-        }
-
-        close(socket_fd);
-
-        printf(
-            "Thread [%lu]: username '%s' already exists.\n",
-            (unsigned long)thread_id,
-            username
-        );
-
-        return NULL;
-    }
-
-    /*
-     * Any other negative result indicates a registry
-     * or internal failure.
-     */
-    if (client_id < 0)
-    {
-        if (send_message(
-                socket_fd,
-                MSG_ERROR,
-                "SERVER_CLIENT_LIMIT"
-            ) != 0)
-        {
-            fprintf(
-                stderr,
-                "Thread [%lu]: failed to send client-limit response.\n",
-                (unsigned long)thread_id
-            );
-        }
-
-        close(socket_fd);
-
-        printf(
-            "Thread [%lu]: client registry full or unavailable.\n",
-            (unsigned long)thread_id
-        );
-
-        return NULL;
-    }
 
     printf(
         "Client %d registered: %s\n",
@@ -439,61 +442,12 @@ void *client_handler(void *argument)
         username
     );
 
-    /*
-     * Confirm successful login.
-     */
-    char login_message[MESSAGE_MAX_SIZE + 1];
-
-    int login_message_length = snprintf(
-        login_message,
-        sizeof(login_message),
-        "LOGIN_SUCCESS %s",
-        username
-    );
-
-    if (login_message_length < 0 ||
-        (size_t)login_message_length >=
-            sizeof(login_message))
-    {
-        fprintf(
-            stderr,
-            "Client %d: failed to construct login response.\n",
-            client_id
-        );
-
-        client_manager_remove(socket_fd);
-        close(socket_fd);
-
-        return NULL;
-    }
-
-    if (send_message(
-            socket_fd,
-            MSG_RESPONSE,
-            login_message
-        ) != 0)
-    {
-        fprintf(
-            stderr,
-            "Client %d: failed to send login confirmation.\n",
-            client_id
-        );
-
-        client_manager_remove(socket_fd);
-        close(socket_fd);
-
-        return NULL;
-    }
 
     /*
-     * Persistent communication loop.
+     * PERSISTENT MESSAGE LOOP
      */
-    char payload[MESSAGE_MAX_SIZE + 1];
-
     while (1)
     {
-        uint32_t message_type;
-
         int result = receive_message(
             socket_fd,
             &message_type,
@@ -501,13 +455,15 @@ void *client_handler(void *argument)
             sizeof(payload)
         );
 
+
         /*
-         * Client closed the TCP connection.
+         * Client closed TCP connection without sending
+         * an explicit MSG_DISCONNECT.
          */
         if (result == 1)
         {
             printf(
-                "Client %d (%s) disconnected.\n",
+                "Client %d (%s) closed the connection.\n",
                 client_id,
                 username
             );
@@ -515,14 +471,12 @@ void *client_handler(void *argument)
             break;
         }
 
-        /*
-         * Protocol or communication error.
-         */
+
         if (result < 0)
         {
             fprintf(
                 stderr,
-                "Client %d (%s): receive error.\n",
+                "Client %d (%s): receive/protocol error.\n",
                 client_id,
                 username
             );
@@ -530,17 +484,42 @@ void *client_handler(void *argument)
             break;
         }
 
+
         switch (message_type)
         {
+            /*
+             * PUBLIC CHAT
+             */
             case MSG_CHAT:
             {
+                /*
+                 * Empty chat messages are rejected.
+                 */
+                if (payload[0] == '\0')
+                {
+                    client_manager_send(
+                        socket_fd,
+                        MSG_ERROR,
+                        "EMPTY_MESSAGE"
+                    );
+
+                    break;
+                }
+
+
+                /*
+                 * Construct:
+                 *
+                 *     username: message
+                 *
+                 * The resulting broadcast itself must
+                 * remain within MESSAGE_MAX_SIZE.
+                 */
                 char broadcast_message[
-                    MESSAGE_MAX_SIZE +
-                    USERNAME_MAX_SIZE +
-                    8
+                    MESSAGE_MAX_SIZE + 1
                 ];
 
-                int broadcast_length = snprintf(
+                int written = snprintf(
                     broadcast_message,
                     sizeof(broadcast_message),
                     "%s: %s",
@@ -548,27 +527,46 @@ void *client_handler(void *argument)
                     payload
                 );
 
-                if (broadcast_length < 0 ||
-                    (size_t)broadcast_length >=
+                if (written < 0 ||
+                    (size_t)written >=
                         sizeof(broadcast_message))
                 {
-                    fprintf(
-                        stderr,
-                        "Client %d: failed to format broadcast message.\n",
-                        client_id
+                    client_manager_send(
+                        socket_fd,
+                        MSG_ERROR,
+                        "MESSAGE_TOO_LONG"
                     );
-
-                    if (send_message(
-                            socket_fd,
-                            MSG_ERROR,
-                            "MESSAGE_TOO_LARGE"
-                        ) != 0)
-                    {
-                        goto connection_end;
-                    }
 
                     break;
                 }
+
+
+                int recipients =
+                    client_manager_broadcast(
+                        socket_fd,
+                        MSG_BROADCAST,
+                        broadcast_message
+                    );
+
+
+                if (recipients < 0)
+                {
+                    client_manager_send(
+                        socket_fd,
+                        MSG_ERROR,
+                        "BROADCAST_FAILED"
+                    );
+
+                    fprintf(
+                        stderr,
+                        "Client %d (%s): broadcast failed.\n",
+                        client_id,
+                        username
+                    );
+
+                    break;
+                }
+
 
                 printf(
                     "Broadcast from Client %d (%s): %s\n",
@@ -577,85 +575,63 @@ void *client_handler(void *argument)
                     payload
                 );
 
+
                 /*
-                 * client_manager_broadcast():
+                 * Send delivery count to the sender.
                  *
-                 * 1. Locks the registry.
-                 * 2. Takes references to target sockets.
-                 * 3. Copies target socket descriptors.
-                 * 4. Unlocks the registry.
-                 * 5. Performs send() operations without
-                 *    holding the global registry mutex.
+                 * This also uses the per-client send
+                 * mutex because another client thread
+                 * may simultaneously broadcast to this
+                 * socket.
                  */
-                int recipients =
-                    client_manager_broadcast(
-                        socket_fd,
-                        MSG_BROADCAST,
-                        broadcast_message
-                    );
+                char response[64];
 
-                if (recipients < 0)
+                written = snprintf(
+                    response,
+                    sizeof(response),
+                    "MESSAGE_DELIVERED %d",
+                    recipients
+                );
+
+                if (written >= 0 &&
+                    (size_t)written <
+                        sizeof(response))
                 {
-                    fprintf(
-                        stderr,
-                        "Client %d: broadcast failed.\n",
-                        client_id
-                    );
-
-                    if (send_message(
+                    if (client_manager_send(
                             socket_fd,
-                            MSG_ERROR,
-                            "BROADCAST_FAILED"
+                            MSG_RESPONSE,
+                            response
                         ) != 0)
                     {
-                        goto connection_end;
+                        fprintf(
+                            stderr,
+                            "Client %d: failed to send delivery response.\n",
+                            client_id
+                        );
                     }
-
-                    break;
-                }
-
-                /*
-                 * Acknowledge the sender.
-                 */
-                char acknowledgement[128];
-
-                int acknowledgement_length =
-                    snprintf(
-                        acknowledgement,
-                        sizeof(acknowledgement),
-                        "MESSAGE_DELIVERED %d",
-                        recipients
-                    );
-
-                if (acknowledgement_length < 0 ||
-                    (size_t)acknowledgement_length >=
-                        sizeof(acknowledgement))
-                {
-                    goto connection_end;
-                }
-
-                if (send_message(
-                        socket_fd,
-                        MSG_RESPONSE,
-                        acknowledgement
-                    ) != 0)
-                {
-                    goto connection_end;
                 }
 
                 break;
             }
 
 
+            /*
+             * GRACEFUL DISCONNECT
+             */
             case MSG_DISCONNECT:
-
+            {
                 printf(
                     "Client %d (%s) requested disconnect.\n",
                     client_id,
                     username
                 );
 
-                if (send_message(
+
+                /*
+                 * Send GOODBYE while the client is still
+                 * registered. Removal happens afterward.
+                 */
+                if (client_manager_send(
                         socket_fd,
                         MSG_RESPONSE,
                         "GOODBYE"
@@ -669,62 +645,102 @@ void *client_handler(void *argument)
                 }
 
                 goto connection_end;
+            }
 
 
+            /*
+             * FILE SHARING PLACEHOLDERS
+             *
+             * Protocol message types already exist,
+             * but the actual transfer subsystem will be
+             * implemented in a later milestone.
+             */
             case MSG_UPLOAD:
-
-                if (send_message(
-                        socket_fd,
-                        MSG_ERROR,
-                        "FILE_UPLOAD_NOT_IMPLEMENTED"
-                    ) != 0)
-                {
-                    goto connection_end;
-                }
+            {
+                client_manager_send(
+                    socket_fd,
+                    MSG_ERROR,
+                    "UPLOAD_NOT_IMPLEMENTED"
+                );
 
                 break;
+            }
 
 
             case MSG_DOWNLOAD:
-
-                if (send_message(
-                        socket_fd,
-                        MSG_ERROR,
-                        "FILE_DOWNLOAD_NOT_IMPLEMENTED"
-                    ) != 0)
-                {
-                    goto connection_end;
-                }
+            {
+                client_manager_send(
+                    socket_fd,
+                    MSG_ERROR,
+                    "DOWNLOAD_NOT_IMPLEMENTED"
+                );
 
                 break;
+            }
 
 
             case MSG_LIST_FILES:
-
-                if (send_message(
-                        socket_fd,
-                        MSG_ERROR,
-                        "FILE_LIST_NOT_IMPLEMENTED"
-                    ) != 0)
-                {
-                    goto connection_end;
-                }
+            {
+                client_manager_send(
+                    socket_fd,
+                    MSG_ERROR,
+                    "LIST_FILES_NOT_IMPLEMENTED"
+                );
 
                 break;
+            }
+
+
+            /*
+             * A client may not log in a second time
+             * after the session has been established.
+             */
+            case MSG_LOGIN:
+            {
+                client_manager_send(
+                    socket_fd,
+                    MSG_ERROR,
+                    "ALREADY_LOGGED_IN"
+                );
+
+                break;
+            }
+
+
+            /*
+             * These are server-originated message types.
+             * Receiving them from a client is considered
+             * invalid application behavior.
+             */
+            case MSG_RESPONSE:
+            case MSG_ERROR:
+            case MSG_BROADCAST:
+            case MSG_USERLIST:
+            {
+                client_manager_send(
+                    socket_fd,
+                    MSG_ERROR,
+                    "INVALID_CLIENT_MESSAGE_TYPE"
+                );
+
+                break;
+            }
 
 
             default:
-
-                if (send_message(
-                        socket_fd,
-                        MSG_ERROR,
-                        "UNSUPPORTED_OPERATION"
-                    ) != 0)
-                {
-                    goto connection_end;
-                }
+            {
+                /*
+                 * Normally unreachable because
+                 * receive_message() validates the type.
+                 */
+                client_manager_send(
+                    socket_fd,
+                    MSG_ERROR,
+                    "UNKNOWN_MESSAGE_TYPE"
+                );
 
                 break;
+            }
         }
     }
 
@@ -732,58 +748,58 @@ void *client_handler(void *argument)
 connection_end:
 
     /*
-     * Remove the client from the registry before closing
-     * the socket.
+     * Remove the connection from the shared registry
+     * before closing the file descriptor.
      *
-     * client_manager_remove() waits for outstanding
-     * broadcast references before allowing the socket
-     * to be released.
+     * client_manager_remove() synchronizes with any
+     * server thread currently sending to this client.
      */
-    remove_result =
-        client_manager_remove(socket_fd);
+    if (client_registered)
+    {
+        remove_result =
+            client_manager_remove(
+                socket_fd
+            );
 
-    if (remove_result == 0)
-    {
+        if (remove_result == 0)
+        {
+            printf(
+                "Client %d (%s) removed from client manager.\n",
+                client_id,
+                username
+            );
+        }
+        else
+        {
+            fprintf(
+                stderr,
+                "Client %d (%s): client manager removal failed.\n",
+                client_id,
+                username
+            );
+        }
+
+
         printf(
-            "Client %d (%s) removed from client manager.\n",
-            client_id,
-            username
+            "Active clients: %zu\n",
+            client_manager_count()
         );
     }
-    else if (remove_result == 1)
-    {
-        fprintf(
-            stderr,
-            "Client %d was not found in registry.\n",
-            client_id
-        );
-    }
-    else
-    {
-        fprintf(
-            stderr,
-            "Client %d: failed to update client registry.\n",
-            client_id
-        );
-    }
+
 
     /*
-     * Release the socket after registry cleanup.
+     * close() happens only after registry removal so
+     * another connection cannot reuse this descriptor
+     * while the old client is still considered active.
      */
-    if (close(socket_fd) != 0)
-    {
-        perror("close client socket");
-    }
+    close(socket_fd);
 
-    printf(
-        "Active clients: %zu\n",
-        client_manager_count()
-    );
 
     printf(
         "Client thread [%lu] terminated.\n",
-        (unsigned long)thread_id
+        (unsigned long)pthread_self()
     );
+
 
     return NULL;
 }

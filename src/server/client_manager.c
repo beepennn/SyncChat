@@ -1,12 +1,22 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "common/network_io.h"
 #include "common/protocol.h"
 #include "server/client_manager.h"
+
+
+typedef struct
+{
+    int slot;
+    unsigned int client_id;
+
+} broadcast_target_t;
+
 
 static client_entry_t clients[MAX_CLIENTS];
 
@@ -15,12 +25,18 @@ static pthread_mutex_t clients_mutex =
 
 static unsigned int next_client_id = 1;
 
+static int manager_initialized = 0;
 
+
+/*
+ * Caller must hold clients_mutex.
+ */
 static int find_free_slot(void)
 {
     for (int i = 0; i < MAX_CLIENTS; i++)
     {
-        if (!clients[i].active)
+        if (!clients[i].active &&
+            clients[i].socket_fd == -1)
         {
             return i;
         }
@@ -30,7 +46,30 @@ static int find_free_slot(void)
 }
 
 
-static int find_username_slot(const char *username)
+/*
+ * Caller must hold clients_mutex.
+ */
+static int find_socket_slot(int socket_fd)
+{
+    for (int i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (clients[i].active &&
+            clients[i].socket_fd == socket_fd)
+        {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+
+/*
+ * Caller must hold clients_mutex.
+ */
+static int find_username_slot(
+    const char *username
+)
 {
     for (int i = 0; i < MAX_CLIENTS; i++)
     {
@@ -48,7 +87,13 @@ static int find_username_slot(const char *username)
 }
 
 
-static int send_message(
+/*
+ * Raw framed network send.
+ *
+ * The caller is responsible for ensuring that
+ * only one thread writes to socket_fd at a time.
+ */
+static int send_message_raw(
     int socket_fd,
     uint32_t type,
     const char *payload
@@ -62,6 +107,11 @@ static int send_message(
         return -1;
     }
 
+    if (!is_valid_message_type(type))
+    {
+        return -1;
+    }
+
     payload_length = strlen(payload);
 
     if (payload_length > MESSAGE_MAX_SIZE)
@@ -70,6 +120,7 @@ static int send_message(
     }
 
     header.type = htonl(type);
+
     header.length = htonl(
         (uint32_t)payload_length
     );
@@ -88,23 +139,128 @@ static int send_message(
         return 0;
     }
 
-    return send_all(
+    if (send_all(
+            socket_fd,
+            payload,
+            payload_length
+        ) != 0)
+    {
+        return -1;
+    }
+
+    return 0;
+}
+
+
+/*
+ * Send to an exact registry slot/client generation.
+ *
+ * client_id prevents an old broadcast snapshot from
+ * accidentally sending to a newly connected client
+ * that later reused the same registry slot.
+ */
+static int send_to_target(
+    int slot,
+    unsigned int expected_client_id,
+    uint32_t message_type,
+    const char *payload
+)
+{
+    if (slot < 0 ||
+        slot >= MAX_CLIENTS)
+    {
+        return -1;
+    }
+
+    if (pthread_mutex_lock(
+            &clients_mutex
+        ) != 0)
+    {
+        return -1;
+    }
+
+    /*
+     * Verify that this is still the same client
+     * recorded by the broadcast snapshot.
+     */
+    if (!clients[slot].active ||
+        clients[slot].client_id != expected_client_id)
+    {
+        pthread_mutex_unlock(
+            &clients_mutex
+        );
+
+        return 1;
+    }
+
+    /*
+     * Lock order throughout the manager:
+     *
+     * clients_mutex -> send_mutex
+     *
+     * Never reverse this order.
+     */
+    if (pthread_mutex_lock(
+            &clients[slot].send_mutex
+        ) != 0)
+    {
+        pthread_mutex_unlock(
+            &clients_mutex
+        );
+
+        return -1;
+    }
+
+    int socket_fd =
+        clients[slot].socket_fd;
+
+    /*
+     * Release the global registry mutex before
+     * performing potentially blocking network I/O.
+     *
+     * The per-client send mutex remains locked.
+     */
+    if (pthread_mutex_unlock(
+            &clients_mutex
+        ) != 0)
+    {
+        pthread_mutex_unlock(
+            &clients[slot].send_mutex
+        );
+
+        return -1;
+    }
+
+    int result = send_message_raw(
         socket_fd,
-        payload,
-        payload_length
+        message_type,
+        payload
     );
+
+    pthread_mutex_unlock(
+        &clients[slot].send_mutex
+    );
+
+    return result;
 }
 
 
 int client_manager_init(void)
 {
-    int result = pthread_mutex_lock(
-        &clients_mutex
-    );
-
-    if (result != 0)
+    if (pthread_mutex_lock(
+            &clients_mutex
+        ) != 0)
     {
         return -1;
+    }
+
+    if (manager_initialized)
+    {
+        pthread_mutex_unlock(
+            &clients_mutex
+        );
+
+        return 0;
     }
 
     memset(
@@ -116,15 +272,42 @@ int client_manager_init(void)
     for (int i = 0; i < MAX_CLIENTS; i++)
     {
         clients[i].socket_fd = -1;
+
+        if (pthread_mutex_init(
+                &clients[i].send_mutex,
+                NULL
+            ) != 0)
+        {
+            /*
+             * Destroy mutexes that were already
+             * successfully initialized.
+             */
+            for (int j = 0; j < i; j++)
+            {
+                pthread_mutex_destroy(
+                    &clients[j].send_mutex
+                );
+            }
+
+            pthread_mutex_unlock(
+                &clients_mutex
+            );
+
+            return -1;
+        }
     }
 
     next_client_id = 1;
+    manager_initialized = 1;
 
-    result = pthread_mutex_unlock(
-        &clients_mutex
-    );
+    if (pthread_mutex_unlock(
+            &clients_mutex
+        ) != 0)
+    {
+        return -1;
+    }
 
-    return result == 0 ? 0 : -1;
+    return 0;
 }
 
 
@@ -139,18 +322,16 @@ int client_manager_add(
         return -1;
     }
 
-    int result = pthread_mutex_lock(
-        &clients_mutex
-    );
-
-    if (result != 0)
+    if (pthread_mutex_lock(
+            &clients_mutex
+        ) != 0)
     {
         return -1;
     }
 
     /*
-     * Username check and insertion happen while
-     * holding the same mutex.
+     * Username uniqueness check and insertion are
+     * performed inside the same critical section.
      */
     if (find_username_slot(username) >= 0)
     {
@@ -190,49 +371,78 @@ int client_manager_add(
     int client_id =
         (int)clients[slot].client_id;
 
-    result = pthread_mutex_unlock(
-        &clients_mutex
-    );
+    if (pthread_mutex_unlock(
+            &clients_mutex
+        ) != 0)
+    {
+        return -1;
+    }
 
-    return result == 0 ? client_id : -1;
+    return client_id;
 }
 
 
 int client_manager_remove(int socket_fd)
 {
-    int result = pthread_mutex_lock(
-        &clients_mutex
-    );
-
-    if (result != 0)
+    if (pthread_mutex_lock(
+            &clients_mutex
+        ) != 0)
     {
         return -1;
     }
 
-    for (int i = 0; i < MAX_CLIENTS; i++)
+    int slot =
+        find_socket_slot(socket_fd);
+
+    if (slot < 0)
     {
-        if (clients[i].active &&
-            clients[i].socket_fd == socket_fd)
-        {
-            clients[i].active = 0;
-            clients[i].socket_fd = -1;
-            clients[i].thread_id = (pthread_t)0;
-            clients[i].client_id = 0;
-            clients[i].username[0] = '\0';
+        pthread_mutex_unlock(
+            &clients_mutex
+        );
 
-            result = pthread_mutex_unlock(
-                &clients_mutex
-            );
-
-            return result == 0 ? 0 : -1;
-        }
+        return 1;
     }
 
-    result = pthread_mutex_unlock(
-        &clients_mutex
+    /*
+     * Wait for any currently active send to this
+     * socket to complete before removing it.
+     *
+     * The global mutex prevents another thread from
+     * starting a new send while removal begins.
+     */
+    if (pthread_mutex_lock(
+            &clients[slot].send_mutex
+        ) != 0)
+    {
+        pthread_mutex_unlock(
+            &clients_mutex
+        );
+
+        return -1;
+    }
+
+    clients[slot].active = 0;
+    clients[slot].socket_fd = -1;
+    clients[slot].thread_id = (pthread_t)0;
+    clients[slot].client_id = 0;
+    clients[slot].username[0] = '\0';
+
+    if (pthread_mutex_unlock(
+            &clients_mutex
+        ) != 0)
+    {
+        pthread_mutex_unlock(
+            &clients[slot].send_mutex
+        );
+
+        return -1;
+    }
+
+    pthread_mutex_unlock(
+        &clients[slot].send_mutex
     );
 
-    return result == 0 ? 1 : -1;
+    return 0;
 }
 
 
@@ -274,14 +484,9 @@ int client_manager_contains(int socket_fd)
         return 0;
     }
 
-    for (int i = 0; i < MAX_CLIENTS; i++)
+    if (find_socket_slot(socket_fd) >= 0)
     {
-        if (clients[i].active &&
-            clients[i].socket_fd == socket_fd)
-        {
-            found = 1;
-            break;
-        }
+        found = 1;
     }
 
     pthread_mutex_unlock(
@@ -338,44 +543,44 @@ int client_manager_get_username(
         return -1;
     }
 
-    for (int i = 0; i < MAX_CLIENTS; i++)
+    int slot =
+        find_socket_slot(socket_fd);
+
+    if (slot < 0)
     {
-        if (clients[i].active &&
-            clients[i].socket_fd == socket_fd)
-        {
-            strncpy(
-                username,
-                clients[i].username,
-                username_size - 1
-            );
+        pthread_mutex_unlock(
+            &clients_mutex
+        );
 
-            username[
-                username_size - 1
-            ] = '\0';
-
-            pthread_mutex_unlock(
-                &clients_mutex
-            );
-
-            return 0;
-        }
+        return 1;
     }
+
+    strncpy(
+        username,
+        clients[slot].username,
+        username_size - 1
+    );
+
+    username[
+        username_size - 1
+    ] = '\0';
 
     pthread_mutex_unlock(
         &clients_mutex
     );
 
-    return 1;
+    return 0;
 }
 
 
-int client_manager_broadcast(
-    int sender_socket,
+int client_manager_send(
+    int socket_fd,
     uint32_t message_type,
     const char *payload
 )
 {
-    if (payload == NULL)
+    if (payload == NULL ||
+        !is_valid_message_type(message_type))
     {
         return -1;
     }
@@ -385,10 +590,87 @@ int client_manager_broadcast(
         return -1;
     }
 
+    if (pthread_mutex_lock(
+            &clients_mutex
+        ) != 0)
+    {
+        return -1;
+    }
+
+    int slot =
+        find_socket_slot(socket_fd);
+
+    if (slot < 0)
+    {
+        pthread_mutex_unlock(
+            &clients_mutex
+        );
+
+        return 1;
+    }
+
     /*
-     * Snapshot target sockets while protected.
+     * Lock the destination stream while the registry
+     * mutex guarantees that the slot cannot disappear.
      */
-    int target_sockets[MAX_CLIENTS];
+    if (pthread_mutex_lock(
+            &clients[slot].send_mutex
+        ) != 0)
+    {
+        pthread_mutex_unlock(
+            &clients_mutex
+        );
+
+        return -1;
+    }
+
+    int destination_socket =
+        clients[slot].socket_fd;
+
+    if (pthread_mutex_unlock(
+            &clients_mutex
+        ) != 0)
+    {
+        pthread_mutex_unlock(
+            &clients[slot].send_mutex
+        );
+
+        return -1;
+    }
+
+    int result = send_message_raw(
+        destination_socket,
+        message_type,
+        payload
+    );
+
+    pthread_mutex_unlock(
+        &clients[slot].send_mutex
+    );
+
+    return result;
+}
+
+
+int client_manager_broadcast(
+    int sender_socket,
+    uint32_t message_type,
+    const char *payload
+)
+{
+    if (payload == NULL ||
+        !is_valid_message_type(message_type))
+    {
+        return -1;
+    }
+
+    if (strlen(payload) > MESSAGE_MAX_SIZE)
+    {
+        return -1;
+    }
+
+    broadcast_target_t targets[MAX_CLIENTS];
+
     size_t target_count = 0;
 
     if (pthread_mutex_lock(
@@ -398,6 +680,14 @@ int client_manager_broadcast(
         return -1;
     }
 
+    /*
+     * Snapshot logical client identities rather than
+     * only file descriptors.
+     *
+     * A client ID changes when a registry slot is
+     * reused, preventing stale snapshots from targeting
+     * a different connection.
+     */
     for (int i = 0; i < MAX_CLIENTS; i++)
     {
         if (!clients[i].active)
@@ -405,47 +695,50 @@ int client_manager_broadcast(
             continue;
         }
 
-        if (clients[i].socket_fd == sender_socket)
+        if (clients[i].socket_fd ==
+            sender_socket)
         {
             continue;
         }
 
-        target_sockets[target_count++] =
-            clients[i].socket_fd;
+        targets[target_count].slot = i;
+
+        targets[target_count].client_id =
+            clients[i].client_id;
+
+        target_count++;
     }
 
-    /*
-     * IMPORTANT:
-     * Network I/O is not performed while the
-     * client registry mutex is held.
-     */
-    pthread_mutex_unlock(
-        &clients_mutex
-    );
+    if (pthread_mutex_unlock(
+            &clients_mutex
+        ) != 0)
+    {
+        return -1;
+    }
 
     size_t successful = 0;
 
-    /*
-     * Send using the snapshot.
-     */
     for (size_t i = 0;
          i < target_count;
          i++)
     {
-        if (send_message(
-                target_sockets[i],
-                message_type,
-                payload
-            ) == 0)
+        int result = send_to_target(
+            targets[i].slot,
+            targets[i].client_id,
+            message_type,
+            payload
+        );
+
+        if (result == 0)
         {
             successful++;
         }
-        else
+        else if (result < 0)
         {
             fprintf(
                 stderr,
-                "Broadcast failed for socket %d.\n",
-                target_sockets[i]
+                "Broadcast send failed for client ID %u.\n",
+                targets[i].client_id
             );
         }
     }
