@@ -557,7 +557,7 @@ int main(void)
     );
 
     printf(
-        "Commands: /quit\n"
+        "Commands: /users /quit\n"
     );
 
 
@@ -656,7 +656,40 @@ int main(void)
         }
 
 
+                /*
+         * Request current online-user list.
+         */
         if (strcmp(
+                payload,
+                "/users"
+            ) == 0)
+        {
+            if (send_message(
+                    MSG_LIST_USERS,
+                    ""
+                ) != 0)
+            {
+                fprintf(
+                    stderr,
+                    "Failed to request online users.\n"
+                );
+
+                atomic_store(
+                    &client_running,
+                    0
+                );
+
+                shutdown(
+                    client_socket,
+                    SHUT_RDWR
+                );
+
+                break;
+            }
+
+            continue;
+        }
+	if (strcmp(
                 payload,
                 "/quit"
             ) == 0)

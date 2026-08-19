@@ -572,6 +572,92 @@ int client_manager_get_username(
     return 0;
 }
 
+int client_manager_build_userlist(
+    char *buffer,
+    size_t buffer_size
+)
+{
+    if (buffer == NULL ||
+        buffer_size == 0)
+    {
+        return -1;
+    }
+
+    if (pthread_mutex_lock(
+            &clients_mutex
+        ) != 0)
+    {
+        return -1;
+    }
+
+    size_t used = 0;
+    int user_count = 0;
+
+    buffer[0] = '\0';
+
+    for (int i = 0;
+         i < MAX_CLIENTS;
+         i++)
+    {
+        if (!clients[i].active)
+        {
+            continue;
+        }
+
+        size_t username_length =
+            strlen(clients[i].username);
+
+        /*
+         * Space required:
+         *
+         * username + '\n' + final '\0'
+         */
+        if (used +
+            username_length +
+            2 >
+            buffer_size)
+        {
+            pthread_mutex_unlock(
+                &clients_mutex
+            );
+
+            return -1;
+        }
+
+        memcpy(
+            buffer + used,
+            clients[i].username,
+            username_length
+        );
+
+        used += username_length;
+
+        buffer[used++] = '\n';
+
+        buffer[used] = '\0';
+
+        user_count++;
+    }
+
+    /*
+     * Remove the final newline so the receiver's
+     * formatting remains clean.
+     */
+    if (used > 0)
+    {
+        buffer[used - 1] = '\0';
+    }
+
+    if (pthread_mutex_unlock(
+            &clients_mutex
+        ) != 0)
+    {
+        return -1;
+    }
+
+    return user_count;
+}
+
 
 int client_manager_send(
     int socket_fd,

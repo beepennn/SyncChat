@@ -645,6 +645,63 @@ void *client_handler(void *argument)
                 }
 
                 goto connection_end;
+	    }
+
+	                /*
+             * ONLINE USER LIST
+             */
+            case MSG_LIST_USERS:
+            {
+                char user_list[
+                    MESSAGE_MAX_SIZE + 1
+                ];
+
+                int users =
+                    client_manager_build_userlist(
+                        user_list,
+                        sizeof(user_list)
+                    );
+
+                if (users < 0)
+                {
+                    client_manager_send(
+                        socket_fd,
+                        MSG_ERROR,
+                        "USERLIST_FAILED"
+                    );
+
+                    break;
+                }
+
+                if (users == 0)
+                {
+                    strncpy(
+                        user_list,
+                        "No users online",
+                        sizeof(user_list) - 1
+                    );
+
+                    user_list[
+                        sizeof(user_list) - 1
+                    ] = '\0';
+                }
+
+                if (client_manager_send(
+                        socket_fd,
+                        MSG_USERLIST,
+                        user_list
+                    ) != 0)
+                {
+                    fprintf(
+                        stderr,
+                        "Client %d (%s): "
+                        "failed to send user list.\n",
+                        client_id,
+                        username
+                    );
+                }
+
+                break;
             }
 
 

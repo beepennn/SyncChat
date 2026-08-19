@@ -9,9 +9,11 @@
 
 #define MAX_CLIENTS 64
 
+
 typedef struct
 {
     int active;
+
     int socket_fd;
 
     pthread_t thread_id;
@@ -29,20 +31,9 @@ typedef struct
 } client_entry_t;
 
 
-/*
- * Initialize the shared client registry.
- */
 int client_manager_init(void);
 
 
-/*
- * Register a logged-in client.
- *
- * Return:
- *   >0  assigned client ID
- *   -1  registry/full/internal error
- *   -2  username already exists
- */
 int client_manager_add(
     int socket_fd,
     pthread_t thread_id,
@@ -50,14 +41,6 @@ int client_manager_add(
 );
 
 
-/*
- * Remove a registered client.
- *
- * Return:
- *   0  removed
- *   1  client not found
- *  -1  internal error
- */
 int client_manager_remove(int socket_fd);
 
 
@@ -80,11 +63,19 @@ int client_manager_get_username(
 
 
 /*
- * Thread-safe framed send to one registered client.
+ * Build a newline-separated snapshot of currently
+ * logged-in usernames.
  *
- * All post-login server writes should use this
- * function instead of writing directly to the socket.
+ * Return:
+ *   >=0 number of users copied
+ *    -1 error
  */
+int client_manager_build_userlist(
+    char *buffer,
+    size_t buffer_size
+);
+
+
 int client_manager_send(
     int socket_fd,
     uint32_t message_type,
@@ -92,13 +83,6 @@ int client_manager_send(
 );
 
 
-/*
- * Broadcast one framed message to every active
- * client except sender_socket.
- *
- * Returns the number of successful recipients,
- * or -1 on manager/protocol failure.
- */
 int client_manager_broadcast(
     int sender_socket,
     uint32_t message_type,

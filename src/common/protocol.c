@@ -1,5 +1,6 @@
 #include <ctype.h>
 #include <stddef.h>
+#include <string.h>
 
 #include "common/protocol.h"
 
@@ -18,6 +19,7 @@ int is_valid_message_type(uint32_t type)
         case MSG_ERROR:
         case MSG_BROADCAST:
         case MSG_USERLIST:
+        case MSG_LIST_USERS:
             return 1;
 
         default:
@@ -28,37 +30,31 @@ int is_valid_message_type(uint32_t type)
 
 int is_valid_username(const char *username)
 {
-    size_t length;
-
     if (username == NULL)
     {
         return 0;
     }
 
-    length = 0;
+    size_t length = strlen(username);
 
-    while (username[length] != '\0')
-    {
-        length++;
-
-        if (length >= USERNAME_MAX_SIZE)
-        {
-            return 0;
-        }
-    }
-
-    if (length == 0)
+    /*
+     * One byte is reserved for '\0'.
+     */
+    if (length == 0 ||
+        length >= USERNAME_MAX_SIZE)
     {
         return 0;
     }
 
-    for (size_t i = 0; i < length; i++)
+    for (size_t i = 0;
+         i < length;
+         i++)
     {
         unsigned char character =
             (unsigned char)username[i];
 
-        if (!(isalnum(character) ||
-              character == '_'))
+        if (!isalnum(character) &&
+            character != '_')
         {
             return 0;
         }
