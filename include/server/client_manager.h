@@ -82,6 +82,20 @@ int client_manager_send(
     const char *payload
 );
 
+/*
+ * Send one framed message to a client identified
+ * by username.
+ *
+ * Return:
+ *   0  message delivered
+ *   1  user not currently available
+ *  -1  internal/network error
+ */
+int client_manager_send_to_username(
+    const char *username,
+    uint32_t message_type,
+    const char *payload
+);
 
 int client_manager_broadcast(
     int sender_socket,

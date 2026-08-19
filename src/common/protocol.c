@@ -20,6 +20,7 @@ int is_valid_message_type(uint32_t type)
         case MSG_BROADCAST:
         case MSG_USERLIST:
         case MSG_LIST_USERS:
+        case MSG_PRIVATE:
             return 1;
 
         default:
@@ -37,9 +38,6 @@ int is_valid_username(const char *username)
 
     size_t length = strlen(username);
 
-    /*
-     * One byte is reserved for '\0'.
-     */
     if (length == 0 ||
         length >= USERNAME_MAX_SIZE)
     {

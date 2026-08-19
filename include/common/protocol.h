@@ -25,10 +25,20 @@
 #define MSG_USERLIST     10
 
 /*
- * Client -> Server request for currently
- * connected usernames.
+ * Additional chat operations.
  */
 #define MSG_LIST_USERS   11
+
+/*
+ * Used for both:
+ *
+ * Client -> Server:
+ *     "target_username message"
+ *
+ * Server -> Client:
+ *     "sender_username: message"
+ */
+#define MSG_PRIVATE      12
 
 
 typedef struct

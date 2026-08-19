@@ -737,6 +737,70 @@ int client_manager_send(
     return result;
 }
 
+int client_manager_send_to_username(
+    const char *username,
+    uint32_t message_type,
+    const char *payload
+)
+{
+    if (!is_valid_username(username) ||
+        payload == NULL ||
+        !is_valid_message_type(message_type))
+    {
+        return -1;
+    }
+
+    if (strlen(payload) > MESSAGE_MAX_SIZE)
+    {
+        return -1;
+    }
+
+    /*
+     * Resolve the username while holding the
+     * registry mutex.
+     */
+    if (pthread_mutex_lock(
+            &clients_mutex
+        ) != 0)
+    {
+        return -1;
+    }
+
+    int slot =
+        find_username_slot(username);
+
+    if (slot < 0)
+    {
+        pthread_mutex_unlock(
+            &clients_mutex
+        );
+
+        return 1;
+    }
+
+    /*
+     * Snapshot the logical client ID.
+     *
+     * send_to_target() will verify that this is still
+     * the same connection before sending.
+     */
+    unsigned int client_id =
+        clients[slot].client_id;
+
+    if (pthread_mutex_unlock(
+            &clients_mutex
+        ) != 0)
+    {
+        return -1;
+    }
+
+    return send_to_target(
+        slot,
+        client_id,
+        message_type,
+        payload
+    );
+}
 
 int client_manager_broadcast(
     int sender_socket,

@@ -16,13 +16,11 @@
 /*
  * Raw framed send.
  *
- * This function is used only during the login phase,
- * before the client has been registered in the shared
- * client manager.
+ * This is used only before the client has been
+ * registered in the client manager.
  *
- * After successful registration, all outgoing server
- * messages must use client_manager_send() so that
- * writes to each TCP stream are serialized.
+ * After successful registration, all outgoing
+ * messages must use client_manager_send().
  */
 static int send_message(
     int socket_fd,
@@ -84,13 +82,12 @@ static int send_message(
 
 
 /*
- * Receive one complete framed application message.
+ * Receive one complete framed message.
  *
- * Return values:
- *
+ * Return:
  *   0  complete message received
- *   1  peer closed the connection
- *  -1  protocol/socket error
+ *   1  peer closed connection
+ *  -1  socket/protocol error
  */
 static int receive_message(
     int socket_fd,
@@ -182,16 +179,9 @@ static int receive_message(
 
 
 /*
- * Perform the initial username/login handshake.
- *
- * Login-phase messages use send_message() because the
- * client has not yet been entered into the registry.
- *
- * Once client_manager_add() succeeds, every subsequent
- * server write goes through client_manager_send().
+ * Initial username/login handshake.
  *
  * Return:
- *
  *   >0  assigned client ID
  *    0  login rejected
  *   -1  connection/internal error
@@ -215,7 +205,8 @@ static int perform_login(
     }
 
     /*
-     * Ask the newly connected client for a username.
+     * Client is not registered yet, so the raw
+     * login-phase send function is safe here.
      */
     if (send_message(
             socket_fd,
@@ -231,9 +222,6 @@ static int perform_login(
         return -1;
     }
 
-    /*
-     * Receive LOGIN request.
-     */
     result = receive_message(
         socket_fd,
         &message_type,
@@ -241,18 +229,8 @@ static int perform_login(
         sizeof(payload)
     );
 
-    if (result == 1)
+    if (result != 0)
     {
-        return -1;
-    }
-
-    if (result < 0)
-    {
-        fprintf(
-            stderr,
-            "Failed to receive login request.\n"
-        );
-
         return -1;
     }
 
@@ -290,8 +268,7 @@ static int perform_login(
 
     /*
      * Username uniqueness checking and registry
-     * insertion are performed atomically inside
-     * client_manager_add().
+     * insertion happen atomically inside the manager.
      */
     int client_id = client_manager_add(
         socket_fd,
@@ -322,10 +299,8 @@ static int perform_login(
     }
 
     /*
-     * The client is registered from this point onward.
-     *
-     * Therefore LOGIN_SUCCESS must use the serialized
-     * client_manager_send() path.
+     * From this point onward the socket is registered,
+     * so all sends use the serialized manager path.
      */
     char response[USERNAME_MAX_SIZE + 32];
 
@@ -393,8 +368,8 @@ void *client_handler(void *argument)
     socket_fd = context->socket_fd;
 
     /*
-     * Ownership of the dynamically allocated context
-     * belongs to this client thread.
+     * The client thread owns this dynamically
+     * allocated context.
      */
     free(context);
 
@@ -456,10 +431,6 @@ void *client_handler(void *argument)
         );
 
 
-        /*
-         * Client closed TCP connection without sending
-         * an explicit MSG_DISCONNECT.
-         */
         if (result == 1)
         {
             printf(
@@ -492,9 +463,6 @@ void *client_handler(void *argument)
              */
             case MSG_CHAT:
             {
-                /*
-                 * Empty chat messages are rejected.
-                 */
                 if (payload[0] == '\0')
                 {
                     client_manager_send(
@@ -507,14 +475,6 @@ void *client_handler(void *argument)
                 }
 
 
-                /*
-                 * Construct:
-                 *
-                 *     username: message
-                 *
-                 * The resulting broadcast itself must
-                 * remain within MESSAGE_MAX_SIZE.
-                 */
                 char broadcast_message[
                     MESSAGE_MAX_SIZE + 1
                 ];
@@ -576,14 +536,6 @@ void *client_handler(void *argument)
                 );
 
 
-                /*
-                 * Send delivery count to the sender.
-                 *
-                 * This also uses the per-client send
-                 * mutex because another client thread
-                 * may simultaneously broadcast to this
-                 * socket.
-                 */
                 char response[64];
 
                 written = snprintf(
@@ -605,7 +557,8 @@ void *client_handler(void *argument)
                     {
                         fprintf(
                             stderr,
-                            "Client %d: failed to send delivery response.\n",
+                            "Client %d: failed to send "
+                            "delivery response.\n",
                             client_id
                         );
                     }
@@ -616,38 +569,173 @@ void *client_handler(void *argument)
 
 
             /*
-             * GRACEFUL DISCONNECT
+             * PRIVATE MESSAGE
+             *
+             * Payload format:
+             *
+             *     target_username message
              */
-            case MSG_DISCONNECT:
+            case MSG_PRIVATE:
             {
-                printf(
-                    "Client %d (%s) requested disconnect.\n",
-                    client_id,
-                    username
-                );
+                char *separator =
+                    strchr(payload, ' ');
+
+                if (separator == NULL ||
+                    separator == payload ||
+                    separator[1] == '\0')
+                {
+                    client_manager_send(
+                        socket_fd,
+                        MSG_ERROR,
+                        "PRIVATE_MESSAGE_USAGE"
+                    );
+
+                    break;
+                }
 
 
                 /*
-                 * Send GOODBYE while the client is still
-                 * registered. Removal happens afterward.
+                 * Split the payload in place:
+                 *
+                 * Bob Hello Bob
+                 *
+                 * becomes:
+                 *
+                 * target_username = "Bob"
+                 * private_text    = "Hello Bob"
                  */
-                if (client_manager_send(
+                *separator = '\0';
+
+                const char *target_username =
+                    payload;
+
+                const char *private_text =
+                    separator + 1;
+
+
+                if (!is_valid_username(
+                        target_username
+                    ))
+                {
+                    client_manager_send(
+                        socket_fd,
+                        MSG_ERROR,
+                        "INVALID_TARGET_USERNAME"
+                    );
+
+                    break;
+                }
+
+
+                if (strcmp(
+                        target_username,
+                        username
+                    ) == 0)
+                {
+                    client_manager_send(
+                        socket_fd,
+                        MSG_ERROR,
+                        "CANNOT_MESSAGE_SELF"
+                    );
+
+                    break;
+                }
+
+
+                char private_message[
+                    MESSAGE_MAX_SIZE + 1
+                ];
+
+                int written = snprintf(
+                    private_message,
+                    sizeof(private_message),
+                    "%s: %s",
+                    username,
+                    private_text
+                );
+
+                if (written < 0 ||
+                    (size_t)written >=
+                        sizeof(private_message))
+                {
+                    client_manager_send(
+                        socket_fd,
+                        MSG_ERROR,
+                        "PRIVATE_MESSAGE_TOO_LONG"
+                    );
+
+                    break;
+                }
+
+
+                int send_result =
+                    client_manager_send_to_username(
+                        target_username,
+                        MSG_PRIVATE,
+                        private_message
+                    );
+
+
+                if (send_result == 1)
+                {
+                    client_manager_send(
+                        socket_fd,
+                        MSG_ERROR,
+                        "USER_NOT_FOUND"
+                    );
+
+                    break;
+                }
+
+
+                if (send_result < 0)
+                {
+                    client_manager_send(
+                        socket_fd,
+                        MSG_ERROR,
+                        "PRIVATE_MESSAGE_FAILED"
+                    );
+
+                    break;
+                }
+
+
+                char response[
+                    USERNAME_MAX_SIZE + 40
+                ];
+
+                written = snprintf(
+                    response,
+                    sizeof(response),
+                    "PRIVATE_MESSAGE_DELIVERED %s",
+                    target_username
+                );
+
+                if (written >= 0 &&
+                    (size_t)written <
+                        sizeof(response))
+                {
+                    client_manager_send(
                         socket_fd,
                         MSG_RESPONSE,
-                        "GOODBYE"
-                    ) != 0)
-                {
-                    fprintf(
-                        stderr,
-                        "Client %d: failed to send GOODBYE response.\n",
-                        client_id
+                        response
                     );
                 }
 
-                goto connection_end;
-	    }
 
-	                /*
+                printf(
+                    "Private message from Client %d (%s) "
+                    "to %s.\n",
+                    client_id,
+                    username,
+                    target_username
+                );
+
+                break;
+            }
+
+
+            /*
              * ONLINE USER LIST
              */
             case MSG_LIST_USERS:
@@ -662,6 +750,7 @@ void *client_handler(void *argument)
                         sizeof(user_list)
                     );
 
+
                 if (users < 0)
                 {
                     client_manager_send(
@@ -672,6 +761,7 @@ void *client_handler(void *argument)
 
                     break;
                 }
+
 
                 if (users == 0)
                 {
@@ -685,6 +775,7 @@ void *client_handler(void *argument)
                         sizeof(user_list) - 1
                     ] = '\0';
                 }
+
 
                 if (client_manager_send(
                         socket_fd,
@@ -706,11 +797,37 @@ void *client_handler(void *argument)
 
 
             /*
+             * GRACEFUL DISCONNECT
+             */
+            case MSG_DISCONNECT:
+            {
+                printf(
+                    "Client %d (%s) requested disconnect.\n",
+                    client_id,
+                    username
+                );
+
+
+                if (client_manager_send(
+                        socket_fd,
+                        MSG_RESPONSE,
+                        "GOODBYE"
+                    ) != 0)
+                {
+                    fprintf(
+                        stderr,
+                        "Client %d: failed to send "
+                        "GOODBYE response.\n",
+                        client_id
+                    );
+                }
+
+                goto connection_end;
+            }
+
+
+            /*
              * FILE SHARING PLACEHOLDERS
-             *
-             * Protocol message types already exist,
-             * but the actual transfer subsystem will be
-             * implemented in a later milestone.
              */
             case MSG_UPLOAD:
             {
@@ -749,8 +866,8 @@ void *client_handler(void *argument)
 
 
             /*
-             * A client may not log in a second time
-             * after the session has been established.
+             * A logged-in client may not send
+             * another login request.
              */
             case MSG_LOGIN:
             {
@@ -765,9 +882,7 @@ void *client_handler(void *argument)
 
 
             /*
-             * These are server-originated message types.
-             * Receiving them from a client is considered
-             * invalid application behavior.
+             * Server-originated message types.
              */
             case MSG_RESPONSE:
             case MSG_ERROR:
@@ -786,10 +901,6 @@ void *client_handler(void *argument)
 
             default:
             {
-                /*
-                 * Normally unreachable because
-                 * receive_message() validates the type.
-                 */
                 client_manager_send(
                     socket_fd,
                     MSG_ERROR,
@@ -805,11 +916,8 @@ void *client_handler(void *argument)
 connection_end:
 
     /*
-     * Remove the connection from the shared registry
-     * before closing the file descriptor.
-     *
-     * client_manager_remove() synchronizes with any
-     * server thread currently sending to this client.
+     * Remove from the shared registry before closing
+     * the descriptor.
      */
     if (client_registered)
     {
@@ -817,6 +925,7 @@ connection_end:
             client_manager_remove(
                 socket_fd
             );
+
 
         if (remove_result == 0)
         {
@@ -830,7 +939,8 @@ connection_end:
         {
             fprintf(
                 stderr,
-                "Client %d (%s): client manager removal failed.\n",
+                "Client %d (%s): "
+                "client manager removal failed.\n",
                 client_id,
                 username
             );
@@ -844,11 +954,6 @@ connection_end:
     }
 
 
-    /*
-     * close() happens only after registry removal so
-     * another connection cannot reuse this descriptor
-     * while the old client is still considered active.
-     */
     close(socket_fd);
 
 

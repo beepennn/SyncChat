@@ -22,31 +22,46 @@ static pthread_mutex_t output_mutex =
 
 
 /*
- * Print text while preventing multiple threads
- * from writing to stdout simultaneously.
+ * Thread-safe console output.
  */
-static void safe_printf(const char *prefix, const char *message)
+static void safe_printf(
+    const char *prefix,
+    const char *message
+)
 {
-    pthread_mutex_lock(&output_mutex);
+    pthread_mutex_lock(
+        &output_mutex
+    );
 
     if (prefix != NULL)
     {
-        printf("%s", prefix);
+        printf(
+            "%s",
+            prefix
+        );
     }
 
     if (message != NULL)
     {
-        printf("%s", message);
+        printf(
+            "%s",
+            message
+        );
     }
 
     fflush(stdout);
 
-    pthread_mutex_unlock(&output_mutex);
+    pthread_mutex_unlock(
+        &output_mutex
+    );
 }
 
 
 /*
- * Send one framed application message.
+ * Send one complete framed application message.
+ *
+ * The main/input thread is the only client-side
+ * sender after login.
  */
 static int send_message(
     uint32_t type,
@@ -54,6 +69,7 @@ static int send_message(
 )
 {
     message_header_t header;
+
     size_t payload_length;
 
     if (payload == NULL)
@@ -61,17 +77,28 @@ static int send_message(
         return -1;
     }
 
-    payload_length = strlen(payload);
-
-    if (payload_length > MESSAGE_MAX_SIZE)
+    if (!is_valid_message_type(type))
     {
         return -1;
     }
 
-    header.type = htonl(type);
-    header.length = htonl(
-        (uint32_t)payload_length
-    );
+    payload_length =
+        strlen(payload);
+
+    if (payload_length >
+        MESSAGE_MAX_SIZE)
+    {
+        return -1;
+    }
+
+    header.type =
+        htonl(type);
+
+    header.length =
+        htonl(
+            (uint32_t)payload_length
+        );
+
 
     if (send_all(
             client_socket,
@@ -82,27 +109,33 @@ static int send_message(
         return -1;
     }
 
+
     if (payload_length == 0)
     {
         return 0;
     }
 
-    return send_all(
-        client_socket,
-        payload,
-        payload_length
-    );
+
+    if (send_all(
+            client_socket,
+            payload,
+            payload_length
+        ) != 0)
+    {
+        return -1;
+    }
+
+    return 0;
 }
 
 
 /*
- * Receive one framed application message.
+ * Receive one complete framed application message.
  *
- * Return values:
- *
- *   0  message received
- *   1  peer closed connection
- *  -1  protocol/socket error
+ * Return:
+ *   0  complete message received
+ *   1  server closed connection
+ *  -1  socket/protocol error
  */
 static int receive_message(
     uint32_t *message_type,
@@ -115,7 +148,18 @@ static int receive_message(
     uint32_t type;
     uint32_t length;
 
-    int result = recv_all(
+    int result;
+
+
+    if (message_type == NULL ||
+        payload == NULL ||
+        payload_size == 0)
+    {
+        return -1;
+    }
+
+
+    result = recv_all(
         client_socket,
         &header,
         sizeof(header)
@@ -126,8 +170,13 @@ static int receive_message(
         return result;
     }
 
-    type = ntohl(header.type);
-    length = ntohl(header.length);
+
+    type =
+        ntohl(header.type);
+
+    length =
+        ntohl(header.length);
+
 
     if (!is_valid_message_type(type))
     {
@@ -140,7 +189,9 @@ static int receive_message(
         return -1;
     }
 
-    if (length > MESSAGE_MAX_SIZE)
+
+    if (length >
+        MESSAGE_MAX_SIZE)
     {
         fprintf(
             stderr,
@@ -150,7 +201,9 @@ static int receive_message(
         return -1;
     }
 
-    if ((size_t)length >= payload_size)
+
+    if ((size_t)length >=
+        payload_size)
     {
         fprintf(
             stderr,
@@ -159,6 +212,7 @@ static int receive_message(
 
         return -1;
     }
+
 
     if (length > 0)
     {
@@ -174,6 +228,7 @@ static int receive_message(
         }
     }
 
+
     payload[length] = '\0';
 
     *message_type = type;
@@ -182,9 +237,14 @@ static int receive_message(
 }
 
 
+/*
+ * Establish TCP connection to the local SyncChat
+ * server.
+ */
 static int connect_to_server(void)
 {
     struct sockaddr_in server_address;
+
 
     client_socket = socket(
         AF_INET,
@@ -195,8 +255,10 @@ static int connect_to_server(void)
     if (client_socket < 0)
     {
         perror("socket");
+
         return -1;
     }
+
 
     memset(
         &server_address,
@@ -204,9 +266,13 @@ static int connect_to_server(void)
         sizeof(server_address)
     );
 
-    server_address.sin_family = AF_INET;
+
+    server_address.sin_family =
+        AF_INET;
+
     server_address.sin_port =
         htons(SERVER_PORT);
+
 
     if (inet_pton(
             AF_INET,
@@ -220,10 +286,12 @@ static int connect_to_server(void)
         );
 
         close(client_socket);
+
         client_socket = -1;
 
         return -1;
     }
+
 
     if (connect(
             client_socket,
@@ -234,46 +302,64 @@ static int connect_to_server(void)
         perror("connect");
 
         close(client_socket);
+
         client_socket = -1;
 
         return -1;
     }
 
+
     return 0;
 }
 
 
+/*
+ * Close client socket exactly once.
+ */
 static void cleanup_socket(void)
 {
     if (client_socket >= 0)
     {
-        close(client_socket);
+        close(
+            client_socket
+        );
+
         client_socket = -1;
     }
 }
 
 
 /*
- * Dedicated receiver thread.
+ * Dedicated asynchronous receiver thread.
  *
- * After login succeeds, this thread becomes the
- * only thread responsible for receiving messages
- * from the server.
+ * After login this is the only thread that reads
+ * from the TCP socket.
  */
-static void *receiver_thread(void *argument)
+static void *receiver_thread(
+    void *argument
+)
 {
     (void)argument;
 
-    char payload[MESSAGE_MAX_SIZE + 1];
+
+    char payload[
+        MESSAGE_MAX_SIZE + 1
+    ];
+
     uint32_t message_type;
 
-    while (atomic_load(&client_running))
+
+    while (atomic_load(
+            &client_running
+        ))
     {
-        int result = receive_message(
-            &message_type,
-            payload,
-            sizeof(payload)
-        );
+        int result =
+            receive_message(
+                &message_type,
+                payload,
+                sizeof(payload)
+            );
+
 
         if (result == 1)
         {
@@ -290,13 +376,12 @@ static void *receiver_thread(void *argument)
             break;
         }
 
+
         if (result < 0)
         {
-            /*
-             * shutdown() during normal termination may
-             * also cause recv() to return an error.
-             */
-            if (atomic_load(&client_running))
+            if (atomic_load(
+                    &client_running
+                ))
             {
                 safe_printf(
                     "\n",
@@ -312,26 +397,55 @@ static void *receiver_thread(void *argument)
             break;
         }
 
+
         pthread_mutex_lock(
             &output_mutex
         );
 
+
         printf("\n");
+
 
         switch (message_type)
         {
+            /*
+             * Public chat message.
+             */
             case MSG_BROADCAST:
+            {
                 printf(
                     "%s\n",
                     payload
                 );
-                break;
 
+                break;
+            }
+
+
+            /*
+             * Private chat message.
+             */
+            case MSG_PRIVATE:
+            {
+                printf(
+                    "[Private] %s\n",
+                    payload
+                );
+
+                break;
+            }
+
+
+            /*
+             * General server response.
+             */
             case MSG_RESPONSE:
+            {
                 printf(
                     "[Server] %s\n",
                     payload
                 );
+
 
                 if (strcmp(
                         payload,
@@ -345,35 +459,57 @@ static void *receiver_thread(void *argument)
                 }
 
                 break;
+            }
 
+
+            /*
+             * Server error.
+             */
             case MSG_ERROR:
+            {
                 printf(
                     "[Error] %s\n",
                     payload
                 );
-                break;
 
+                break;
+            }
+
+
+            /*
+             * Online user list.
+             */
             case MSG_USERLIST:
+            {
                 printf(
                     "[Online Users]\n%s\n",
                     payload
                 );
+
                 break;
+            }
+
 
             default:
+            {
                 printf(
                     "[Server message type %u] %s\n",
                     message_type,
                     payload
                 );
+
                 break;
+            }
         }
 
+
         fflush(stdout);
+
 
         pthread_mutex_unlock(
             &output_mutex
         );
+
 
         if (!atomic_load(
                 &client_running
@@ -383,14 +519,20 @@ static void *receiver_thread(void *argument)
         }
     }
 
+
     return NULL;
 }
 
 
 int main(void)
 {
-    char payload[MESSAGE_MAX_SIZE + 1];
-    char username[USERNAME_MAX_SIZE];
+    char payload[
+        MESSAGE_MAX_SIZE + 1
+    ];
+
+    char username[
+        USERNAME_MAX_SIZE
+    ];
 
     uint32_t message_type;
 
@@ -399,10 +541,14 @@ int main(void)
     int receiver_created = 0;
 
 
+    /*
+     * CONNECT
+     */
     if (connect_to_server() != 0)
     {
         return EXIT_FAILURE;
     }
+
 
     printf(
         "Connected to SyncChat server.\n"
@@ -410,16 +556,17 @@ int main(void)
 
 
     /*
-     * Login phase remains synchronous.
+     * LOGIN PHASE
      *
-     * The receiver thread is intentionally not
-     * started until authentication succeeds.
+     * Login remains synchronous.
      */
-    int result = receive_message(
-        &message_type,
-        payload,
-        sizeof(payload)
-    );
+    int result =
+        receive_message(
+            &message_type,
+            payload,
+            sizeof(payload)
+        );
+
 
     if (result != 0)
     {
@@ -433,7 +580,9 @@ int main(void)
         return EXIT_FAILURE;
     }
 
-    if (message_type != MSG_RESPONSE ||
+
+    if (message_type !=
+            MSG_RESPONSE ||
         strcmp(
             payload,
             "USERNAME_REQUIRED"
@@ -451,10 +600,17 @@ int main(void)
     }
 
 
+    /*
+     * USERNAME INPUT
+     */
     while (1)
     {
-        printf("Username: ");
+        printf(
+            "Username: "
+        );
+
         fflush(stdout);
+
 
         if (fgets(
                 username,
@@ -463,27 +619,40 @@ int main(void)
             ) == NULL)
         {
             cleanup_socket();
+
             return EXIT_FAILURE;
         }
 
+
         username[
-            strcspn(username, "\n")
+            strcspn(
+                username,
+                "\n"
+            )
         ] = '\0';
 
-        if (!is_valid_username(username))
+
+        if (!is_valid_username(
+                username
+            ))
         {
             printf(
                 "Invalid username. "
-                "Use letters, digits, and underscore only.\n"
+                "Use letters, digits, "
+                "and underscore only.\n"
             );
 
             continue;
         }
 
+
         break;
     }
 
 
+    /*
+     * SEND LOGIN
+     */
     if (send_message(
             MSG_LOGIN,
             username
@@ -500,11 +669,16 @@ int main(void)
     }
 
 
-    result = receive_message(
-        &message_type,
-        payload,
-        sizeof(payload)
-    );
+    /*
+     * LOGIN RESPONSE
+     */
+    result =
+        receive_message(
+            &message_type,
+            payload,
+            sizeof(payload)
+        );
+
 
     if (result != 0)
     {
@@ -519,7 +693,8 @@ int main(void)
     }
 
 
-    if (message_type == MSG_ERROR)
+    if (message_type ==
+        MSG_ERROR)
     {
         printf(
             "Login rejected: %s\n",
@@ -532,11 +707,14 @@ int main(void)
     }
 
 
-    if (message_type != MSG_RESPONSE ||
+    if (message_type !=
+            MSG_RESPONSE ||
         strncmp(
             payload,
             "LOGIN_SUCCESS",
-            strlen("LOGIN_SUCCESS")
+            strlen(
+                "LOGIN_SUCCESS"
+            )
         ) != 0)
     {
         fprintf(
@@ -556,13 +734,17 @@ int main(void)
         username
     );
 
+
     printf(
-        "Commands: /users /quit\n"
+        "Commands:\n"
+        "  /users\n"
+        "  /msg <user> <message>\n"
+        "  /quit\n"
     );
 
 
     /*
-     * From this point onward:
+     * From this point:
      *
      * main thread     -> send
      * receiver thread -> receive
@@ -572,12 +754,15 @@ int main(void)
         1
     );
 
-    int pthread_result = pthread_create(
-        &receiver,
-        NULL,
-        receiver_thread,
-        NULL
-    );
+
+    int pthread_result =
+        pthread_create(
+            &receiver,
+            NULL,
+            receiver_thread,
+            NULL
+        );
+
 
     if (pthread_result != 0)
     {
@@ -591,9 +776,13 @@ int main(void)
         return EXIT_FAILURE;
     }
 
+
     receiver_created = 1;
 
 
+    /*
+     * INPUT/SEND LOOP
+     */
     while (atomic_load(
             &client_running
         ))
@@ -602,12 +791,14 @@ int main(void)
             &output_mutex
         );
 
+
         printf(
             "%s> ",
             username
         );
 
         fflush(stdout);
+
 
         pthread_mutex_unlock(
             &output_mutex
@@ -621,7 +812,7 @@ int main(void)
             ) == NULL)
         {
             /*
-             * stdin EOF: request a graceful disconnect.
+             * stdin EOF.
              */
             if (atomic_load(
                     &client_running
@@ -638,7 +829,10 @@ int main(void)
 
 
         payload[
-            strcspn(payload, "\n")
+            strcspn(
+                payload,
+                "\n"
+            )
         ] = '\0';
 
 
@@ -656,8 +850,8 @@ int main(void)
         }
 
 
-                /*
-         * Request current online-user list.
+        /*
+         * /users
          */
         if (strcmp(
                 payload,
@@ -689,7 +883,163 @@ int main(void)
 
             continue;
         }
-	if (strcmp(
+
+
+        /*
+         * /msg <username> <message>
+         */
+        if (strncmp(
+                payload,
+                "/msg",
+                4
+            ) == 0)
+        {
+            /*
+             * Reject malformed forms such as:
+             *
+             * /msg
+             * /msgBob hello
+             */
+            if (strncmp(
+                    payload,
+                    "/msg ",
+                    5
+                ) != 0)
+            {
+                safe_printf(
+                    NULL,
+                    "Usage: /msg <user> <message>\n"
+                );
+
+                continue;
+            }
+
+
+            char *request =
+                payload + 5;
+
+
+            char *separator =
+                strchr(
+                    request,
+                    ' '
+                );
+
+
+            if (separator == NULL ||
+                separator == request ||
+                separator[1] == '\0')
+            {
+                safe_printf(
+                    NULL,
+                    "Usage: /msg <user> <message>\n"
+                );
+
+                continue;
+            }
+
+
+            size_t target_length =
+                (size_t)(
+                    separator -
+                    request
+                );
+
+
+            if (target_length >=
+                USERNAME_MAX_SIZE)
+            {
+                safe_printf(
+                    NULL,
+                    "Invalid target username.\n"
+                );
+
+                continue;
+            }
+
+
+            char target[
+                USERNAME_MAX_SIZE
+            ];
+
+
+            memcpy(
+                target,
+                request,
+                target_length
+            );
+
+
+            target[
+                target_length
+            ] = '\0';
+
+
+            if (!is_valid_username(
+                    target
+                ))
+            {
+                safe_printf(
+                    NULL,
+                    "Invalid target username.\n"
+                );
+
+                continue;
+            }
+
+
+            if (strcmp(
+                    target,
+                    username
+                ) == 0)
+            {
+                safe_printf(
+                    NULL,
+                    "You cannot privately "
+                    "message yourself.\n"
+                );
+
+                continue;
+            }
+
+
+            /*
+             * Server receives:
+             *
+             * Bob Hello Bob
+             */
+            if (send_message(
+                    MSG_PRIVATE,
+                    request
+                ) != 0)
+            {
+                fprintf(
+                    stderr,
+                    "Failed to send private message.\n"
+                );
+
+                atomic_store(
+                    &client_running,
+                    0
+                );
+
+                shutdown(
+                    client_socket,
+                    SHUT_RDWR
+                );
+
+                break;
+            }
+
+
+            continue;
+        }
+
+
+        /*
+         * /quit
+         */
+        if (strcmp(
                 payload,
                 "/quit"
             ) == 0)
@@ -715,16 +1065,18 @@ int main(void)
                 );
             }
 
+
             /*
-             * Do not close the socket yet.
-             *
-             * The receiver thread remains alive so that
-             * it can receive the server's GOODBYE.
+             * Receiver remains alive so it can receive
+             * the server's GOODBYE response.
              */
             break;
         }
 
 
+        /*
+         * NORMAL PUBLIC CHAT MESSAGE
+         */
         if (send_message(
                 MSG_CHAT,
                 payload
@@ -751,10 +1103,7 @@ int main(void)
 
 
     /*
-     * Wait for the receiver to finish.
-     *
-     * On /quit, the server should send GOODBYE and
-     * subsequently close its side of the connection.
+     * Wait for receiver thread.
      */
     if (receiver_created)
     {
@@ -770,15 +1119,19 @@ int main(void)
         0
     );
 
+
     cleanup_socket();
+
 
     pthread_mutex_destroy(
         &output_mutex
     );
 
+
     printf(
         "Disconnected from server.\n"
     );
+
 
     return EXIT_SUCCESS;
 }
