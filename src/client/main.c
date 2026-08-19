@@ -1,4 +1,6 @@
 #include <arpa/inet.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,9 +15,38 @@
 
 static int client_socket = -1;
 
+static atomic_int client_running = 1;
+
+static pthread_mutex_t output_mutex =
+    PTHREAD_MUTEX_INITIALIZER;
+
 
 /*
- * Send one length-prefixed application message.
+ * Print text while preventing multiple threads
+ * from writing to stdout simultaneously.
+ */
+static void safe_printf(const char *prefix, const char *message)
+{
+    pthread_mutex_lock(&output_mutex);
+
+    if (prefix != NULL)
+    {
+        printf("%s", prefix);
+    }
+
+    if (message != NULL)
+    {
+        printf("%s", message);
+    }
+
+    fflush(stdout);
+
+    pthread_mutex_unlock(&output_mutex);
+}
+
+
+/*
+ * Send one framed application message.
  */
 static int send_message(
     uint32_t type,
@@ -34,11 +65,6 @@ static int send_message(
 
     if (payload_length > MESSAGE_MAX_SIZE)
     {
-        fprintf(
-            stderr,
-            "Message exceeds maximum size.\n"
-        );
-
         return -1;
     }
 
@@ -70,12 +96,13 @@ static int send_message(
 
 
 /*
- * Receive one length-prefixed application message.
+ * Receive one framed application message.
  *
- * Return:
- *   0  success
- *   1  peer disconnected
- *  -1  error
+ * Return values:
+ *
+ *   0  message received
+ *   1  peer closed connection
+ *  -1  protocol/socket error
  */
 static int receive_message(
     uint32_t *message_type,
@@ -117,7 +144,7 @@ static int receive_message(
     {
         fprintf(
             stderr,
-            "Received message is too large.\n"
+            "Received message exceeds maximum size.\n"
         );
 
         return -1;
@@ -127,7 +154,7 @@ static int receive_message(
     {
         fprintf(
             stderr,
-            "Payload buffer is too small.\n"
+            "Receive buffer is too small.\n"
         );
 
         return -1;
@@ -216,7 +243,7 @@ static int connect_to_server(void)
 }
 
 
-static void cleanup(void)
+static void cleanup_socket(void)
 {
     if (client_socket >= 0)
     {
@@ -226,11 +253,151 @@ static void cleanup(void)
 }
 
 
+/*
+ * Dedicated receiver thread.
+ *
+ * After login succeeds, this thread becomes the
+ * only thread responsible for receiving messages
+ * from the server.
+ */
+static void *receiver_thread(void *argument)
+{
+    (void)argument;
+
+    char payload[MESSAGE_MAX_SIZE + 1];
+    uint32_t message_type;
+
+    while (atomic_load(&client_running))
+    {
+        int result = receive_message(
+            &message_type,
+            payload,
+            sizeof(payload)
+        );
+
+        if (result == 1)
+        {
+            safe_printf(
+                "\n",
+                "Server closed the connection.\n"
+            );
+
+            atomic_store(
+                &client_running,
+                0
+            );
+
+            break;
+        }
+
+        if (result < 0)
+        {
+            /*
+             * shutdown() during normal termination may
+             * also cause recv() to return an error.
+             */
+            if (atomic_load(&client_running))
+            {
+                safe_printf(
+                    "\n",
+                    "Connection receive error.\n"
+                );
+            }
+
+            atomic_store(
+                &client_running,
+                0
+            );
+
+            break;
+        }
+
+        pthread_mutex_lock(
+            &output_mutex
+        );
+
+        printf("\n");
+
+        switch (message_type)
+        {
+            case MSG_BROADCAST:
+                printf(
+                    "%s\n",
+                    payload
+                );
+                break;
+
+            case MSG_RESPONSE:
+                printf(
+                    "[Server] %s\n",
+                    payload
+                );
+
+                if (strcmp(
+                        payload,
+                        "GOODBYE"
+                    ) == 0)
+                {
+                    atomic_store(
+                        &client_running,
+                        0
+                    );
+                }
+
+                break;
+
+            case MSG_ERROR:
+                printf(
+                    "[Error] %s\n",
+                    payload
+                );
+                break;
+
+            case MSG_USERLIST:
+                printf(
+                    "[Online Users]\n%s\n",
+                    payload
+                );
+                break;
+
+            default:
+                printf(
+                    "[Server message type %u] %s\n",
+                    message_type,
+                    payload
+                );
+                break;
+        }
+
+        fflush(stdout);
+
+        pthread_mutex_unlock(
+            &output_mutex
+        );
+
+        if (!atomic_load(
+                &client_running
+            ))
+        {
+            break;
+        }
+    }
+
+    return NULL;
+}
+
+
 int main(void)
 {
     char payload[MESSAGE_MAX_SIZE + 1];
+    char username[USERNAME_MAX_SIZE];
 
     uint32_t message_type;
+
+    pthread_t receiver;
+
+    int receiver_created = 0;
+
 
     if (connect_to_server() != 0)
     {
@@ -241,8 +408,12 @@ int main(void)
         "Connected to SyncChat server.\n"
     );
 
+
     /*
-     * Wait for USERNAME_REQUIRED.
+     * Login phase remains synchronous.
+     *
+     * The receiver thread is intentionally not
+     * started until authentication succeeds.
      */
     int result = receive_message(
         &message_type,
@@ -250,26 +421,14 @@ int main(void)
         sizeof(payload)
     );
 
-    if (result == 1)
+    if (result != 0)
     {
         fprintf(
             stderr,
-            "Server disconnected.\n"
+            "Failed to receive login request from server.\n"
         );
 
-        cleanup();
-
-        return EXIT_FAILURE;
-    }
-
-    if (result < 0)
-    {
-        fprintf(
-            stderr,
-            "Failed to receive server login request.\n"
-        );
-
-        cleanup();
+        cleanup_socket();
 
         return EXIT_FAILURE;
     }
@@ -282,19 +441,15 @@ int main(void)
     {
         fprintf(
             stderr,
-            "Unexpected server response: %s\n",
+            "Unexpected initial server response: %s\n",
             payload
         );
 
-        cleanup();
+        cleanup_socket();
 
         return EXIT_FAILURE;
     }
 
-    /*
-     * Ask for username.
-     */
-    char username[USERNAME_MAX_SIZE];
 
     while (1)
     {
@@ -307,13 +462,7 @@ int main(void)
                 stdin
             ) == NULL)
         {
-            fprintf(
-                stderr,
-                "Failed to read username.\n"
-            );
-
-            cleanup();
-
+            cleanup_socket();
             return EXIT_FAILURE;
         }
 
@@ -334,50 +483,41 @@ int main(void)
         break;
     }
 
+
     if (send_message(
             MSG_LOGIN,
             username
         ) != 0)
     {
-        perror("send login");
+        fprintf(
+            stderr,
+            "Failed to send login request.\n"
+        );
 
-        cleanup();
+        cleanup_socket();
 
         return EXIT_FAILURE;
     }
 
-    /*
-     * Receive login result.
-     */
+
     result = receive_message(
         &message_type,
         payload,
         sizeof(payload)
     );
 
-    if (result == 1)
-    {
-        fprintf(
-            stderr,
-            "Server disconnected during login.\n"
-        );
-
-        cleanup();
-
-        return EXIT_FAILURE;
-    }
-
-    if (result < 0)
+    if (result != 0)
     {
         fprintf(
             stderr,
             "Failed to receive login response.\n"
         );
 
-        cleanup();
+        cleanup_socket();
 
         return EXIT_FAILURE;
     }
+
 
     if (message_type == MSG_ERROR)
     {
@@ -386,10 +526,11 @@ int main(void)
             payload
         );
 
-        cleanup();
+        cleanup_socket();
 
         return EXIT_FAILURE;
     }
+
 
     if (message_type != MSG_RESPONSE ||
         strncmp(
@@ -404,21 +545,63 @@ int main(void)
             payload
         );
 
-        cleanup();
+        cleanup_socket();
 
         return EXIT_FAILURE;
     }
+
 
     printf(
         "Login successful as '%s'.\n",
         username
     );
 
+    printf(
+        "Commands: /quit\n"
+    );
+
+
     /*
-     * Persistent chat loop.
+     * From this point onward:
+     *
+     * main thread     -> send
+     * receiver thread -> receive
      */
-    while (1)
+    atomic_store(
+        &client_running,
+        1
+    );
+
+    int pthread_result = pthread_create(
+        &receiver,
+        NULL,
+        receiver_thread,
+        NULL
+    );
+
+    if (pthread_result != 0)
     {
+        fprintf(
+            stderr,
+            "Failed to create receiver thread.\n"
+        );
+
+        cleanup_socket();
+
+        return EXIT_FAILURE;
+    }
+
+    receiver_created = 1;
+
+
+    while (atomic_load(
+            &client_running
+        ))
+    {
+        pthread_mutex_lock(
+            &output_mutex
+        );
+
         printf(
             "%s> ",
             username
@@ -426,27 +609,53 @@ int main(void)
 
         fflush(stdout);
 
+        pthread_mutex_unlock(
+            &output_mutex
+        );
+
+
         if (fgets(
                 payload,
                 sizeof(payload),
                 stdin
             ) == NULL)
         {
+            /*
+             * stdin EOF: request a graceful disconnect.
+             */
+            if (atomic_load(
+                    &client_running
+                ))
+            {
+                send_message(
+                    MSG_DISCONNECT,
+                    ""
+                );
+            }
+
             break;
         }
+
 
         payload[
             strcspn(payload, "\n")
         ] = '\0';
+
+
+        if (!atomic_load(
+                &client_running
+            ))
+        {
+            break;
+        }
+
 
         if (payload[0] == '\0')
         {
             continue;
         }
 
-        /*
-         * Graceful disconnect handshake.
-         */
+
         if (strcmp(
                 payload,
                 "/quit"
@@ -462,46 +671,26 @@ int main(void)
                     "Failed to send disconnect request.\n"
                 );
 
-                break;
+                atomic_store(
+                    &client_running,
+                    0
+                );
+
+                shutdown(
+                    client_socket,
+                    SHUT_RDWR
+                );
             }
 
             /*
-             * Wait for the server's GOODBYE response
-             * before closing the socket.
+             * Do not close the socket yet.
+             *
+             * The receiver thread remains alive so that
+             * it can receive the server's GOODBYE.
              */
-            result = receive_message(
-                &message_type,
-                payload,
-                sizeof(payload)
-            );
-
-            if (result == 0 &&
-                message_type == MSG_RESPONSE &&
-                strcmp(
-                    payload,
-                    "GOODBYE"
-                ) == 0)
-            {
-                printf(
-                    "Server: GOODBYE\n"
-                );
-            }
-            else if (result == 1)
-            {
-                printf(
-                    "Server closed the connection.\n"
-                );
-            }
-            else if (result < 0)
-            {
-                fprintf(
-                    stderr,
-                    "Failed to receive disconnect response.\n"
-                );
-            }
-
             break;
         }
+
 
         if (send_message(
                 MSG_CHAT,
@@ -510,69 +699,49 @@ int main(void)
         {
             fprintf(
                 stderr,
-                "Failed to send message.\n"
+                "Failed to send chat message.\n"
+            );
+
+            atomic_store(
+                &client_running,
+                0
+            );
+
+            shutdown(
+                client_socket,
+                SHUT_RDWR
             );
 
             break;
-        }
-
-        /*
-         * Wait for either:
-         *
-         *   MSG_RESPONSE
-         *   MSG_BROADCAST
-         *   MSG_ERROR
-         */
-        result = receive_message(
-            &message_type,
-            payload,
-            sizeof(payload)
-        );
-
-        if (result == 1)
-        {
-            fprintf(
-                stderr,
-                "Server disconnected.\n"
-            );
-
-            break;
-        }
-
-        if (result < 0)
-        {
-            fprintf(
-                stderr,
-                "Failed to receive server response.\n"
-            );
-
-            break;
-        }
-
-        if (message_type == MSG_ERROR)
-        {
-            printf(
-                "Server error: %s\n",
-                payload
-            );
-        }
-        else if (message_type == MSG_BROADCAST)
-        {
-            printf(
-                "%s\n",
-                payload
-            );
-        }
-        else
-        {
-            printf(
-                "Server: %s\n",
-                payload
-            );
         }
     }
 
-    cleanup();
+
+    /*
+     * Wait for the receiver to finish.
+     *
+     * On /quit, the server should send GOODBYE and
+     * subsequently close its side of the connection.
+     */
+    if (receiver_created)
+    {
+        pthread_join(
+            receiver,
+            NULL
+        );
+    }
+
+
+    atomic_store(
+        &client_running,
+        0
+    );
+
+    cleanup_socket();
+
+    pthread_mutex_destroy(
+        &output_mutex
+    );
 
     printf(
         "Disconnected from server.\n"
