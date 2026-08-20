@@ -1008,19 +1008,18 @@ void *client_handler(
 
             case MSG_DOWNLOAD:
             {
-                client_manager_send(
-                    socket_fd,
-                    MSG_ERROR,
-                    "DOWNLOAD_NOT_IMPLEMENTED"
-                );
+                int download_result =
+                    file_manager_handle_download(
+                        socket_fd,
+                        username,
+                        payload
+                    );
 
 
-                logger_client_log(
-                    LOG_WARN,
-                    "CLIENT_HANDLER",
-                    "Download requested before file subsystem implementation username=%s",
-                    username
-                );
+                if (download_result < 0)
+                {
+                    goto connection_end;
+                }
 
 
                 break;

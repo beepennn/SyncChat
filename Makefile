@@ -22,6 +22,8 @@ CLIENT_MANAGER_SRC = src/server/client_manager.c
 FILE_MANAGER_SRC = src/server/file_manager.c
 
 UPLOAD_CLIENT_SRC = src/client/upload_client.c
+DOWNLOAD_CLIENT_SRC = src/client/download_client.c
+
 
 SERVER_SRC = \
 	src/server/main.c \
@@ -36,6 +38,7 @@ SERVER_SRC = \
 CLIENT_SRC = \
 	src/client/main.c \
 	$(UPLOAD_CLIENT_SRC) \
+	$(DOWNLOAD_CLIENT_SRC) \
 	$(NETWORK_IO_SRC) \
 	$(PROTOCOL_SRC) \
 	$(FILE_TRANSFER_SRC)
@@ -78,6 +81,7 @@ $(CLIENT): $(CLIENT_SRC) \
 	include/common/protocol.h \
 	include/common/file_transfer.h \
 	include/client/upload_client.h \
+	include/client/download_client.h \
 	include/server/server_config.h
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) $(CLIENT_SRC) -pthread -o $(CLIENT)

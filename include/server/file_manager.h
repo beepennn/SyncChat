@@ -2,20 +2,29 @@
 #define FILE_MANAGER_H
 
 /*
- * Process one upload request.
+ * Handle one client upload request.
  *
- * metadata format:
+ * metadata:
  *
  *     filename|filesize
- *
- * Return:
- *   0  request processed
- *  -1  connection became unusable
  */
 int file_manager_handle_upload(
     int socket_fd,
     const char *username,
     const char *metadata
+);
+
+
+/*
+ * Handle one download request.
+ *
+ * filename contains only the shared filename,
+ * never a path.
+ */
+int file_manager_handle_download(
+    int socket_fd,
+    const char *username,
+    const char *filename
 );
 
 #endif

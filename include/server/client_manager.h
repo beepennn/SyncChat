@@ -97,6 +97,14 @@ int client_manager_send_to_username(
     const char *payload
 );
 
+int client_manager_send_file_stream(
+    int socket_fd,
+    uint32_t message_type,
+    const char *metadata,
+    int file_fd,
+    uint64_t file_size
+);
+
 int client_manager_broadcast(
     int sender_socket,
     uint32_t message_type,

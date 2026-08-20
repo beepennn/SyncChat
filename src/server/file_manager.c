@@ -616,3 +616,307 @@ int file_manager_handle_upload(
 
     return 0;
 }
+
+int file_manager_handle_download(
+    int socket_fd,
+    const char *username,
+    const char *filename
+)
+{
+    if (username == NULL ||
+        filename == NULL)
+    {
+        return -1;
+    }
+
+
+    /*
+     * The filename validator disallows:
+     *
+     * ../
+     * /
+     * backslashes
+     * hidden names
+     * control characters
+     */
+    if (!is_valid_shared_filename(
+            filename
+        ))
+    {
+        client_manager_send(
+            socket_fd,
+            MSG_ERROR,
+            "INVALID_DOWNLOAD_FILENAME"
+        );
+
+
+        logger_client_log(
+            LOG_WARN,
+            "FILE_MANAGER",
+            "Invalid download filename username=%s",
+            username
+        );
+
+
+        return 0;
+    }
+
+
+    char file_path[
+        PATH_MAX
+    ];
+
+
+    int path_written =
+        snprintf(
+            file_path,
+            sizeof(file_path),
+            "%s/%s",
+            FILE_STORAGE_DIRECTORY,
+            filename
+        );
+
+
+    if (path_written < 0 ||
+        (size_t)path_written >=
+            sizeof(file_path))
+    {
+        client_manager_send(
+            socket_fd,
+            MSG_ERROR,
+            "INVALID_FILE_PATH"
+        );
+
+
+        return 0;
+    }
+
+
+    int open_flags =
+        O_RDONLY;
+
+
+#ifdef O_NOFOLLOW
+    /*
+     * Avoid following a malicious symbolic link
+     * placed in the shared storage directory.
+     */
+    open_flags |=
+        O_NOFOLLOW;
+#endif
+
+
+    int file_fd =
+        open(
+            file_path,
+            open_flags
+        );
+
+
+    if (file_fd < 0)
+    {
+        if (errno == ENOENT)
+        {
+            client_manager_send(
+                socket_fd,
+                MSG_ERROR,
+                "FILE_NOT_FOUND"
+            );
+        }
+        else
+        {
+            client_manager_send(
+                socket_fd,
+                MSG_ERROR,
+                "DOWNLOAD_OPEN_FAILED"
+            );
+        }
+
+
+        logger_client_log(
+            LOG_WARN,
+            "FILE_MANAGER",
+            "Download open failed username=%s filename=%s error=%s",
+            username,
+            filename,
+            strerror(errno)
+        );
+
+
+        return 0;
+    }
+
+
+    struct stat information;
+
+
+    if (fstat(
+            file_fd,
+            &information
+        ) != 0)
+    {
+        close(file_fd);
+
+
+        client_manager_send(
+            socket_fd,
+            MSG_ERROR,
+            "DOWNLOAD_STAT_FAILED"
+        );
+
+
+        return 0;
+    }
+
+
+    if (!S_ISREG(
+            information.st_mode
+        ))
+    {
+        close(file_fd);
+
+
+        client_manager_send(
+            socket_fd,
+            MSG_ERROR,
+            "NOT_A_REGULAR_FILE"
+        );
+
+
+        return 0;
+    }
+
+
+    if (information.st_size < 0)
+    {
+        close(file_fd);
+
+
+        client_manager_send(
+            socket_fd,
+            MSG_ERROR,
+            "INVALID_FILE_SIZE"
+        );
+
+
+        return 0;
+    }
+
+
+    uint64_t file_size =
+        (uint64_t)information.st_size;
+
+
+    if (file_size >
+        FILE_MAX_SIZE)
+    {
+        close(file_fd);
+
+
+        client_manager_send(
+            socket_fd,
+            MSG_ERROR,
+            "FILE_TOO_LARGE"
+        );
+
+
+        return 0;
+    }
+
+
+    /*
+     * Metadata format:
+     *
+     * DOWNLOAD_READY filename|size
+     */
+    char metadata[
+        MESSAGE_MAX_SIZE + 1
+    ];
+
+
+    int metadata_written =
+        snprintf(
+            metadata,
+            sizeof(metadata),
+            "DOWNLOAD_READY %s|%" PRIu64,
+            filename,
+            file_size
+        );
+
+
+    if (metadata_written < 0 ||
+        (size_t)metadata_written >=
+            sizeof(metadata))
+    {
+        close(file_fd);
+
+
+        client_manager_send(
+            socket_fd,
+            MSG_ERROR,
+            "DOWNLOAD_METADATA_FAILED"
+        );
+
+
+        return 0;
+    }
+
+
+    /*
+     * This function serializes the metadata frame and
+     * the complete binary file stream using the
+     * destination client's send mutex.
+     */
+    int send_result =
+        client_manager_send_file_stream(
+            socket_fd,
+            MSG_RESPONSE,
+            metadata,
+            file_fd,
+            file_size
+        );
+
+
+    if (close(
+            file_fd
+        ) != 0)
+    {
+        logger_client_log(
+            LOG_WARN,
+            "FILE_MANAGER",
+            "Failed closing downloaded source filename=%s",
+            filename
+        );
+    }
+
+
+    if (send_result != 0)
+    {
+        logger_client_log(
+            LOG_WARN,
+            "FILE_MANAGER",
+            "Download interrupted username=%s filename=%s",
+            username,
+            filename
+        );
+
+
+        /*
+         * The stream may now be incomplete.
+         */
+        return -1;
+    }
+
+
+    logger_client_log(
+        LOG_INFO,
+        "FILE_MANAGER",
+        "Download success username=%s filename=%s size=%" PRIu64,
+        username,
+        filename,
+        file_size
+    );
+
+
+    return 0;
+}

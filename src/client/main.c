@@ -8,7 +8,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "client/download_client.h"
 #include "client/upload_client.h"
+#include "common/file_transfer.h"
 #include "common/network_io.h"
 #include "common/protocol.h"
 #include "server/server_config.h"
@@ -23,7 +25,7 @@ static pthread_mutex_t output_mutex =
 
 
 /*
- * Thread-safe terminal output.
+ * Thread-safe console output.
  */
 static void safe_printf(
     const char *prefix,
@@ -62,10 +64,10 @@ static void safe_printf(
 
 
 /*
- * Send one complete application-level frame.
+ * Send one complete framed application message.
  *
- * After login the main/input thread is the only
- * normal client-side sender.
+ * After login, the main/input thread performs
+ * normal client-side message transmission.
  */
 static int send_message(
     uint32_t type,
@@ -141,10 +143,11 @@ static int send_message(
 
 
 /*
- * Receive one complete framed application message.
+ * Receive one complete framed message.
  *
  * Return:
- *   0  complete message received
+ *
+ *   0  message received
  *   1  server closed connection
  *  -1  socket/protocol error
  */
@@ -252,7 +255,7 @@ static int receive_message(
 
 
 /*
- * Establish TCP connection to the local server.
+ * Establish the TCP connection to SyncChat.
  */
 static int connect_to_server(void)
 {
@@ -300,9 +303,7 @@ static int connect_to_server(void)
         );
 
 
-        close(
-            client_socket
-        );
+        close(client_socket);
 
         client_socket = -1;
 
@@ -320,9 +321,7 @@ static int connect_to_server(void)
         perror("connect");
 
 
-        close(
-            client_socket
-        );
+        close(client_socket);
 
         client_socket = -1;
 
@@ -336,7 +335,7 @@ static int connect_to_server(void)
 
 
 /*
- * Close the TCP socket once.
+ * Close client socket exactly once.
  */
 static void cleanup_socket(void)
 {
@@ -352,10 +351,12 @@ static void cleanup_socket(void)
 
 
 /*
- * Dedicated receiver thread.
+ * Dedicated asynchronous receiver thread.
  *
- * After login, this thread is the only thread that
- * calls receive_message()/recv() on the TCP socket.
+ * After login this is the only thread that receives
+ * data from the TCP connection.
+ *
+ * File-download raw bytes are also consumed here.
  */
 static void *receiver_thread(
     void *argument
@@ -367,6 +368,12 @@ static void *receiver_thread(
     char payload[
         MESSAGE_MAX_SIZE + 1
     ];
+
+
+    char download_result[
+        MESSAGE_MAX_SIZE + 1
+    ];
+
 
     uint32_t message_type;
 
@@ -384,13 +391,13 @@ static void *receiver_thread(
 
 
         /*
-         * Server closed the connection.
+         * Server performed an orderly shutdown.
          */
         if (result == 1)
         {
             /*
-             * Wake a possible upload operation waiting
-             * for UPLOAD_READY/UPLOAD_SUCCESS.
+             * Wake an upload operation that might be
+             * waiting on its condition variable.
              */
             upload_client_notify_connection_closed();
 
@@ -412,7 +419,7 @@ static void *receiver_thread(
 
 
         /*
-         * Socket/protocol failure.
+         * Socket or protocol error.
          */
         if (result < 0)
         {
@@ -441,13 +448,15 @@ static void *receiver_thread(
 
 
         /*
-         * Upload responses must be consumed by the
-         * upload state machine instead of being shown
-         * as ordinary server responses.
+         * ------------------------------------------------
+         * UPLOAD CONTROL RESPONSES
+         * ------------------------------------------------
          *
-         * The receiver thread remains the only socket
-         * reader; upload_client_upload() waits using
-         * a condition variable.
+         * The receiver thread receives UPLOAD_READY and
+         * UPLOAD_SUCCESS/UPLOAD_ERROR responses.
+         *
+         * upload_client.c passes them to the input thread
+         * through a mutex + condition variable.
          */
         if (upload_client_handle_server_message(
                 message_type,
@@ -458,6 +467,112 @@ static void *receiver_thread(
         }
 
 
+        /*
+         * ------------------------------------------------
+         * DOWNLOAD STREAM
+         * ------------------------------------------------
+         *
+         * A DOWNLOAD_READY response is immediately
+         * followed by exactly file_size raw bytes.
+         *
+         * The receiver thread therefore remains the
+         * exclusive socket reader while reconstructing
+         * the downloaded file.
+         */
+        int download_status =
+            download_client_handle_server_message(
+                client_socket,
+                message_type,
+                payload,
+                download_result,
+                sizeof(download_result)
+            );
+
+
+        if (download_status != 0)
+        {
+            /*
+             * Successful download.
+             */
+            if (download_status == 1)
+            {
+                if (pthread_mutex_lock(
+                        &output_mutex
+                    ) == 0)
+                {
+                    printf(
+                        "\n[Download] %s\n",
+                        download_result
+                    );
+
+
+                    fflush(stdout);
+
+
+                    pthread_mutex_unlock(
+                        &output_mutex
+                    );
+                }
+            }
+
+            /*
+             * Network stream remained valid but the
+             * local file could not be stored.
+             */
+            else if (download_status == 2)
+            {
+                if (pthread_mutex_lock(
+                        &output_mutex
+                    ) == 0)
+                {
+                    printf(
+                        "\n[Download Error] %s\n",
+                        download_result
+                    );
+
+
+                    fflush(stdout);
+
+
+                    pthread_mutex_unlock(
+                        &output_mutex
+                    );
+                }
+            }
+
+            /*
+             * The TCP stream became unusable.
+             */
+            else
+            {
+                upload_client_notify_connection_closed();
+
+
+                atomic_store(
+                    &client_running,
+                    0
+                );
+
+
+                shutdown(
+                    client_socket,
+                    SHUT_RDWR
+                );
+
+
+                break;
+            }
+
+
+            continue;
+        }
+
+
+        /*
+         * ------------------------------------------------
+         * NORMAL SERVER MESSAGE
+         * ------------------------------------------------
+         */
         if (pthread_mutex_lock(
                 &output_mutex
             ) != 0)
@@ -486,7 +601,7 @@ static void *receiver_thread(
 
 
             /*
-             * Private message.
+             * Private chat.
              */
             case MSG_PRIVATE:
             {
@@ -527,7 +642,7 @@ static void *receiver_thread(
 
 
             /*
-             * Server-side error.
+             * Server error.
              */
             case MSG_ERROR:
             {
@@ -611,9 +726,9 @@ int main(void)
 
 
     /*
-     * ------------------------------------------------
+     * ====================================================
      * CONNECT
-     * ------------------------------------------------
+     * ====================================================
      */
     if (connect_to_server() != 0)
     {
@@ -627,11 +742,11 @@ int main(void)
 
 
     /*
-     * ------------------------------------------------
+     * ====================================================
      * LOGIN PHASE
      *
-     * Login is intentionally synchronous.
-     * ------------------------------------------------
+     * Login remains synchronous.
+     * ====================================================
      */
     int result =
         receive_message(
@@ -678,7 +793,7 @@ int main(void)
 
 
     /*
-     * Read username.
+     * Read and validate username.
      */
     while (1)
     {
@@ -731,7 +846,7 @@ int main(void)
 
 
     /*
-     * Send LOGIN.
+     * Send login request.
      */
     if (send_message(
             MSG_LOGIN,
@@ -752,7 +867,7 @@ int main(void)
 
 
     /*
-     * Receive login response synchronously.
+     * Wait synchronously for login result.
      */
     result =
         receive_message(
@@ -828,17 +943,21 @@ int main(void)
         "  /users\n"
         "  /msg <user> <message>\n"
         "  /upload <local-path>\n"
+        "  /download <filename>\n"
         "  /quit\n"
     );
 
 
     /*
-     * ------------------------------------------------
+     * ====================================================
      * ASYNCHRONOUS SESSION
      *
-     * main thread     -> sending / keyboard
-     * receiver thread -> receiving
-     * ------------------------------------------------
+     * main thread:
+     *     keyboard input + transmission
+     *
+     * receiver thread:
+     *     server messages + download data
+     * ====================================================
      */
     atomic_store(
         &client_running,
@@ -874,9 +993,9 @@ int main(void)
 
 
     /*
-     * ------------------------------------------------
+     * ====================================================
      * INPUT / SEND LOOP
-     * ------------------------------------------------
+     * ====================================================
      */
     while (atomic_load(
             &client_running
@@ -908,7 +1027,7 @@ int main(void)
             ) == NULL)
         {
             /*
-             * stdin EOF.
+             * End-of-file on stdin.
              */
             if (atomic_load(
                     &client_running
@@ -948,9 +1067,9 @@ int main(void)
 
 
         /*
-         * ------------------------------------------------
+         * =================================================
          * /users
-         * ------------------------------------------------
+         * =================================================
          */
         if (strcmp(
                 payload,
@@ -989,9 +1108,9 @@ int main(void)
 
 
         /*
-         * ------------------------------------------------
+         * =================================================
          * /upload <local-path>
-         * ------------------------------------------------
+         * =================================================
          */
         if (strncmp(
                 payload,
@@ -999,11 +1118,6 @@ int main(void)
                 7
             ) == 0)
         {
-            /*
-             * Require:
-             *
-             * /upload <path>
-             */
             if (strncmp(
                     payload,
                     "/upload ",
@@ -1026,12 +1140,6 @@ int main(void)
             ];
 
 
-            /*
-             * upload_client_upload() sends metadata,
-             * waits for UPLOAD_READY through the
-             * receiver thread, sends binary blocks,
-             * then waits for the final upload result.
-             */
             int upload_status =
                 upload_client_upload(
                     client_socket,
@@ -1078,8 +1186,8 @@ int main(void)
 
 
             /*
-             * Negative result means the TCP stream
-             * can no longer be trusted.
+             * Negative upload result means the TCP
+             * connection can no longer be trusted.
              */
             if (upload_status < 0)
             {
@@ -1104,9 +1212,101 @@ int main(void)
 
 
         /*
-         * ------------------------------------------------
+         * =================================================
+         * /download <filename>
+         * =================================================
+         */
+        if (strncmp(
+                payload,
+                "/download",
+                9
+            ) == 0)
+        {
+            /*
+             * Only a shared filename is accepted.
+             *
+             * Example:
+             *
+             * /download test-upload.bin
+             */
+            if (strncmp(
+                    payload,
+                    "/download ",
+                    10
+                ) != 0 ||
+                payload[10] == '\0')
+            {
+                safe_printf(
+                    NULL,
+                    "Usage: /download <filename>\n"
+                );
+
+
+                continue;
+            }
+
+
+            const char *filename =
+                payload + 10;
+
+
+            /*
+             * Reject paths/path traversal locally before
+             * sending anything to the server.
+             */
+            if (!is_valid_shared_filename(
+                    filename
+                ))
+            {
+                safe_printf(
+                    NULL,
+                    "Invalid shared filename.\n"
+                );
+
+
+                continue;
+            }
+
+
+            if (send_message(
+                    MSG_DOWNLOAD,
+                    filename
+                ) != 0)
+            {
+                fprintf(
+                    stderr,
+                    "Failed to send download request.\n"
+                );
+
+
+                atomic_store(
+                    &client_running,
+                    0
+                );
+
+
+                shutdown(
+                    client_socket,
+                    SHUT_RDWR
+                );
+
+
+                break;
+            }
+
+
+            /*
+             * Actual DOWNLOAD_READY + raw file bytes are
+             * processed asynchronously by receiver_thread.
+             */
+            continue;
+        }
+
+
+        /*
+         * =================================================
          * /msg <username> <message>
-         * ------------------------------------------------
+         * =================================================
          */
         if (strncmp(
                 payload,
@@ -1114,12 +1314,6 @@ int main(void)
                 4
             ) == 0)
         {
-            /*
-             * Reject malformed forms:
-             *
-             * /msg
-             * /msgBob hello
-             */
             if (strncmp(
                     payload,
                     "/msg ",
@@ -1228,11 +1422,6 @@ int main(void)
             }
 
 
-            /*
-             * Payload sent to server:
-             *
-             * Bob Hello Bob
-             */
             if (send_message(
                     MSG_PRIVATE,
                     request
@@ -1265,9 +1454,9 @@ int main(void)
 
 
         /*
-         * ------------------------------------------------
+         * =================================================
          * /quit
-         * ------------------------------------------------
+         * =================================================
          */
         if (strcmp(
                 payload,
@@ -1299,20 +1488,19 @@ int main(void)
 
 
             /*
-             * Do not close the socket here.
+             * Do not close immediately.
              *
-             * Receiver thread remains alive to receive:
-             *
-             *     GOODBYE
+             * Receiver thread remains active until it
+             * receives GOODBYE from the server.
              */
             break;
         }
 
 
         /*
-         * ------------------------------------------------
+         * =================================================
          * NORMAL PUBLIC CHAT
-         * ------------------------------------------------
+         * =================================================
          */
         if (send_message(
                 MSG_CHAT,
@@ -1343,7 +1531,7 @@ int main(void)
 
 
     /*
-     * Wait until the asynchronous receiver exits.
+     * Wait for asynchronous receiver completion.
      */
     if (receiver_created)
     {

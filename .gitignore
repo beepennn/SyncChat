@@ -25,3 +25,7 @@ core.*
 *.swp
 *.swo
 *~
+
+# Downloaded files
+downloads/*
+!downloads/.gitkeep

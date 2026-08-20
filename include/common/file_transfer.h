@@ -11,23 +11,12 @@
     (50ULL * 1024ULL * 1024ULL)
 
 #define FILE_STORAGE_DIRECTORY "storage"
+#define FILE_DOWNLOAD_DIRECTORY "downloads"
 
 /*
- * Validate a filename that will be stored on
- * the server.
+ * Validate a shared filename.
  *
- * Valid examples:
- *
- * report.pdf
- * image_01.png
- * project-file.txt
- *
- * Invalid examples:
- *
- * ../secret
- * /etc/passwd
- * file/name.txt
- * .hidden
+ * Path components are intentionally forbidden.
  */
 int is_valid_shared_filename(
     const char *filename

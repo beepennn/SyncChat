@@ -4,10 +4,14 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
+#include <stdint.h>
+#include <unistd.h>
 
 #include "common/network_io.h"
 #include "common/protocol.h"
 #include "server/client_manager.h"
+#include "common/file_transfer.h"
 
 
 typedef struct
@@ -800,6 +804,224 @@ int client_manager_send_to_username(
         message_type,
         payload
     );
+}
+
+int client_manager_send_file_stream(
+    int socket_fd,
+    uint32_t message_type,
+    const char *metadata,
+    int file_fd,
+    uint64_t file_size
+)
+{
+    if (socket_fd < 0 ||
+        metadata == NULL ||
+        file_fd < 0 ||
+        !is_valid_message_type(message_type) ||
+        strlen(metadata) > MESSAGE_MAX_SIZE ||
+        file_size > FILE_MAX_SIZE)
+    {
+        return -1;
+    }
+
+
+    /*
+     * Resolve the logical client while holding the
+     * registry mutex.
+     */
+    if (pthread_mutex_lock(
+            &clients_mutex
+        ) != 0)
+    {
+        return -1;
+    }
+
+
+    int slot =
+        find_socket_slot(
+            socket_fd
+        );
+
+
+    if (slot < 0)
+    {
+        pthread_mutex_unlock(
+            &clients_mutex
+        );
+
+        return -1;
+    }
+
+
+    unsigned int expected_client_id =
+        clients[slot].client_id;
+
+
+    /*
+     * Lock order remains:
+     *
+     * clients_mutex -> send_mutex
+     */
+    if (pthread_mutex_lock(
+            &clients[slot].send_mutex
+        ) != 0)
+    {
+        pthread_mutex_unlock(
+            &clients_mutex
+        );
+
+        return -1;
+    }
+
+
+    /*
+     * Revalidate while registry state is protected.
+     */
+    if (!clients[slot].active ||
+        clients[slot].socket_fd != socket_fd ||
+        clients[slot].client_id !=
+            expected_client_id)
+    {
+        pthread_mutex_unlock(
+            &clients[slot].send_mutex
+        );
+
+        pthread_mutex_unlock(
+            &clients_mutex
+        );
+
+        return -1;
+    }
+
+
+    /*
+     * Registry can now be released.
+     *
+     * The per-client send mutex remains locked for
+     * the metadata frame AND every raw file byte.
+     *
+     * This prevents broadcasts/private messages from
+     * being inserted into the middle of file data.
+     */
+    if (pthread_mutex_unlock(
+            &clients_mutex
+        ) != 0)
+    {
+        pthread_mutex_unlock(
+            &clients[slot].send_mutex
+        );
+
+        return -1;
+    }
+
+
+    int result =
+        send_message_raw(
+            socket_fd,
+            message_type,
+            metadata
+        );
+
+
+    if (result != 0)
+    {
+        pthread_mutex_unlock(
+            &clients[slot].send_mutex
+        );
+
+        return -1;
+    }
+
+
+    unsigned char buffer[
+        FILE_CHUNK_SIZE
+    ];
+
+
+    uint64_t remaining =
+        file_size;
+
+
+    while (remaining > 0)
+    {
+        size_t requested;
+
+
+        if (remaining >
+            FILE_CHUNK_SIZE)
+        {
+            requested =
+                FILE_CHUNK_SIZE;
+        }
+        else
+        {
+            requested =
+                (size_t)remaining;
+        }
+
+
+        ssize_t bytes_read =
+            read(
+                file_fd,
+                buffer,
+                requested
+            );
+
+
+        if (bytes_read < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+
+            pthread_mutex_unlock(
+                &clients[slot].send_mutex
+            );
+
+            return -1;
+        }
+
+
+        if (bytes_read == 0)
+        {
+            pthread_mutex_unlock(
+                &clients[slot].send_mutex
+            );
+
+            return -1;
+        }
+
+
+        if (send_all(
+                socket_fd,
+                buffer,
+                (size_t)bytes_read
+            ) != 0)
+        {
+            pthread_mutex_unlock(
+                &clients[slot].send_mutex
+            );
+
+            return -1;
+        }
+
+
+        remaining -=
+            (uint64_t)bytes_read;
+    }
+
+
+    if (pthread_mutex_unlock(
+            &clients[slot].send_mutex
+        ) != 0)
+    {
+        return -1;
+    }
+
+
+    return 0;
 }
 
 int client_manager_broadcast(
