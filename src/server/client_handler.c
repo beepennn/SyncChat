@@ -12,7 +12,7 @@
 #include "logger/logger_client.h"
 #include "server/client_handler.h"
 #include "server/client_manager.h"
-
+#include "server/file_manager.h"
 
 static int send_message(
     int socket_fd,
@@ -985,20 +985,22 @@ void *client_handler(
 
             case MSG_UPLOAD:
             {
-                client_manager_send(
-                    socket_fd,
-                    MSG_ERROR,
-                    "UPLOAD_NOT_IMPLEMENTED"
-                );
+                int upload_result =
+                    file_manager_handle_upload(
+                        socket_fd,
+                        username,
+                        payload
+                    );
 
-
-                logger_client_log(
-                    LOG_WARN,
-                    "CLIENT_HANDLER",
-                    "Upload requested before file subsystem implementation username=%s",
-                    username
-                );
-
+                /*
+                 * A negative result means the TCP
+                 * stream became unusable during
+                 * transfer.
+                 */
+                if (upload_result < 0)
+                {
+                    goto connection_end;
+                }
 
                 break;
             }

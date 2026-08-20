@@ -8,6 +8,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "client/upload_client.h"
 #include "common/network_io.h"
 #include "common/protocol.h"
 #include "server/server_config.h"
@@ -22,16 +23,19 @@ static pthread_mutex_t output_mutex =
 
 
 /*
- * Thread-safe console output.
+ * Thread-safe terminal output.
  */
 static void safe_printf(
     const char *prefix,
     const char *message
 )
 {
-    pthread_mutex_lock(
-        &output_mutex
-    );
+    if (pthread_mutex_lock(
+            &output_mutex
+        ) != 0)
+    {
+        return;
+    }
 
     if (prefix != NULL)
     {
@@ -58,10 +62,10 @@ static void safe_printf(
 
 
 /*
- * Send one complete framed application message.
+ * Send one complete application-level frame.
  *
- * The main/input thread is the only client-side
- * sender after login.
+ * After login the main/input thread is the only
+ * normal client-side sender.
  */
 static int send_message(
     uint32_t type,
@@ -72,18 +76,22 @@ static int send_message(
 
     size_t payload_length;
 
+
     if (payload == NULL)
     {
         return -1;
     }
+
 
     if (!is_valid_message_type(type))
     {
         return -1;
     }
 
+
     payload_length =
         strlen(payload);
+
 
     if (payload_length >
         MESSAGE_MAX_SIZE)
@@ -91,8 +99,10 @@ static int send_message(
         return -1;
     }
 
+
     header.type =
         htonl(type);
+
 
     header.length =
         htonl(
@@ -124,6 +134,7 @@ static int send_message(
     {
         return -1;
     }
+
 
     return 0;
 }
@@ -164,6 +175,7 @@ static int receive_message(
         &header,
         sizeof(header)
     );
+
 
     if (result != 0)
     {
@@ -222,6 +234,7 @@ static int receive_message(
             length
         );
 
+
         if (result != 0)
         {
             return result;
@@ -233,13 +246,13 @@ static int receive_message(
 
     *message_type = type;
 
+
     return 0;
 }
 
 
 /*
- * Establish TCP connection to the local SyncChat
- * server.
+ * Establish TCP connection to the local server.
  */
 static int connect_to_server(void)
 {
@@ -251,6 +264,7 @@ static int connect_to_server(void)
         SOCK_STREAM,
         0
     );
+
 
     if (client_socket < 0)
     {
@@ -285,9 +299,13 @@ static int connect_to_server(void)
             "Invalid server address.\n"
         );
 
-        close(client_socket);
+
+        close(
+            client_socket
+        );
 
         client_socket = -1;
+
 
         return -1;
     }
@@ -301,9 +319,13 @@ static int connect_to_server(void)
     {
         perror("connect");
 
-        close(client_socket);
+
+        close(
+            client_socket
+        );
 
         client_socket = -1;
+
 
         return -1;
     }
@@ -314,7 +336,7 @@ static int connect_to_server(void)
 
 
 /*
- * Close client socket exactly once.
+ * Close the TCP socket once.
  */
 static void cleanup_socket(void)
 {
@@ -330,10 +352,10 @@ static void cleanup_socket(void)
 
 
 /*
- * Dedicated asynchronous receiver thread.
+ * Dedicated receiver thread.
  *
- * After login this is the only thread that reads
- * from the TCP socket.
+ * After login, this thread is the only thread that
+ * calls receive_message()/recv() on the TCP socket.
  */
 static void *receiver_thread(
     void *argument
@@ -361,24 +383,42 @@ static void *receiver_thread(
             );
 
 
+        /*
+         * Server closed the connection.
+         */
         if (result == 1)
         {
+            /*
+             * Wake a possible upload operation waiting
+             * for UPLOAD_READY/UPLOAD_SUCCESS.
+             */
+            upload_client_notify_connection_closed();
+
+
             safe_printf(
                 "\n",
                 "Server closed the connection.\n"
             );
+
 
             atomic_store(
                 &client_running,
                 0
             );
 
+
             break;
         }
 
 
+        /*
+         * Socket/protocol failure.
+         */
         if (result < 0)
         {
+            upload_client_notify_connection_closed();
+
+
             if (atomic_load(
                     &client_running
                 ))
@@ -389,18 +429,41 @@ static void *receiver_thread(
                 );
             }
 
+
             atomic_store(
                 &client_running,
                 0
             );
 
+
             break;
         }
 
 
-        pthread_mutex_lock(
-            &output_mutex
-        );
+        /*
+         * Upload responses must be consumed by the
+         * upload state machine instead of being shown
+         * as ordinary server responses.
+         *
+         * The receiver thread remains the only socket
+         * reader; upload_client_upload() waits using
+         * a condition variable.
+         */
+        if (upload_client_handle_server_message(
+                message_type,
+                payload
+            ))
+        {
+            continue;
+        }
+
+
+        if (pthread_mutex_lock(
+                &output_mutex
+            ) != 0)
+        {
+            continue;
+        }
 
 
         printf("\n");
@@ -409,7 +472,7 @@ static void *receiver_thread(
         switch (message_type)
         {
             /*
-             * Public chat message.
+             * Public chat.
              */
             case MSG_BROADCAST:
             {
@@ -423,7 +486,7 @@ static void *receiver_thread(
 
 
             /*
-             * Private chat message.
+             * Private message.
              */
             case MSG_PRIVATE:
             {
@@ -458,12 +521,13 @@ static void *receiver_thread(
                     );
                 }
 
+
                 break;
             }
 
 
             /*
-             * Server error.
+             * Server-side error.
              */
             case MSG_ERROR:
             {
@@ -482,7 +546,8 @@ static void *receiver_thread(
             case MSG_USERLIST:
             {
                 printf(
-                    "[Online Users]\n%s\n",
+                    "[Online Users]\n"
+                    "%s\n",
                     payload
                 );
 
@@ -530,19 +595,25 @@ int main(void)
         MESSAGE_MAX_SIZE + 1
     ];
 
+
     char username[
         USERNAME_MAX_SIZE
     ];
 
+
     uint32_t message_type;
 
+
     pthread_t receiver;
+
 
     int receiver_created = 0;
 
 
     /*
+     * ------------------------------------------------
      * CONNECT
+     * ------------------------------------------------
      */
     if (connect_to_server() != 0)
     {
@@ -556,9 +627,11 @@ int main(void)
 
 
     /*
+     * ------------------------------------------------
      * LOGIN PHASE
      *
-     * Login remains synchronous.
+     * Login is intentionally synchronous.
+     * ------------------------------------------------
      */
     int result =
         receive_message(
@@ -575,7 +648,9 @@ int main(void)
             "Failed to receive login request from server.\n"
         );
 
+
         cleanup_socket();
+
 
         return EXIT_FAILURE;
     }
@@ -594,20 +669,23 @@ int main(void)
             payload
         );
 
+
         cleanup_socket();
+
 
         return EXIT_FAILURE;
     }
 
 
     /*
-     * USERNAME INPUT
+     * Read username.
      */
     while (1)
     {
         printf(
             "Username: "
         );
+
 
         fflush(stdout);
 
@@ -619,6 +697,7 @@ int main(void)
             ) == NULL)
         {
             cleanup_socket();
+
 
             return EXIT_FAILURE;
         }
@@ -642,6 +721,7 @@ int main(void)
                 "and underscore only.\n"
             );
 
+
             continue;
         }
 
@@ -651,7 +731,7 @@ int main(void)
 
 
     /*
-     * SEND LOGIN
+     * Send LOGIN.
      */
     if (send_message(
             MSG_LOGIN,
@@ -663,14 +743,16 @@ int main(void)
             "Failed to send login request.\n"
         );
 
+
         cleanup_socket();
+
 
         return EXIT_FAILURE;
     }
 
 
     /*
-     * LOGIN RESPONSE
+     * Receive login response synchronously.
      */
     result =
         receive_message(
@@ -687,7 +769,9 @@ int main(void)
             "Failed to receive login response.\n"
         );
 
+
         cleanup_socket();
+
 
         return EXIT_FAILURE;
     }
@@ -701,7 +785,9 @@ int main(void)
             payload
         );
 
+
         cleanup_socket();
+
 
         return EXIT_FAILURE;
     }
@@ -723,7 +809,9 @@ int main(void)
             payload
         );
 
+
         cleanup_socket();
+
 
         return EXIT_FAILURE;
     }
@@ -739,15 +827,18 @@ int main(void)
         "Commands:\n"
         "  /users\n"
         "  /msg <user> <message>\n"
+        "  /upload <local-path>\n"
         "  /quit\n"
     );
 
 
     /*
-     * From this point:
+     * ------------------------------------------------
+     * ASYNCHRONOUS SESSION
      *
-     * main thread     -> send
-     * receiver thread -> receive
+     * main thread     -> sending / keyboard
+     * receiver thread -> receiving
+     * ------------------------------------------------
      */
     atomic_store(
         &client_running,
@@ -771,7 +862,9 @@ int main(void)
             "Failed to create receiver thread.\n"
         );
 
+
         cleanup_socket();
+
 
         return EXIT_FAILURE;
     }
@@ -781,28 +874,31 @@ int main(void)
 
 
     /*
-     * INPUT/SEND LOOP
+     * ------------------------------------------------
+     * INPUT / SEND LOOP
+     * ------------------------------------------------
      */
     while (atomic_load(
             &client_running
         ))
     {
-        pthread_mutex_lock(
-            &output_mutex
-        );
+        if (pthread_mutex_lock(
+                &output_mutex
+            ) == 0)
+        {
+            printf(
+                "%s> ",
+                username
+            );
 
 
-        printf(
-            "%s> ",
-            username
-        );
-
-        fflush(stdout);
+            fflush(stdout);
 
 
-        pthread_mutex_unlock(
-            &output_mutex
-        );
+            pthread_mutex_unlock(
+                &output_mutex
+            );
+        }
 
 
         if (fgets(
@@ -823,6 +919,7 @@ int main(void)
                     ""
                 );
             }
+
 
             break;
         }
@@ -851,7 +948,9 @@ int main(void)
 
 
         /*
+         * ------------------------------------------------
          * /users
+         * ------------------------------------------------
          */
         if (strcmp(
                 payload,
@@ -868,25 +967,146 @@ int main(void)
                     "Failed to request online users.\n"
                 );
 
+
                 atomic_store(
                     &client_running,
                     0
                 );
+
 
                 shutdown(
                     client_socket,
                     SHUT_RDWR
                 );
 
+
                 break;
             }
+
 
             continue;
         }
 
 
         /*
+         * ------------------------------------------------
+         * /upload <local-path>
+         * ------------------------------------------------
+         */
+        if (strncmp(
+                payload,
+                "/upload",
+                7
+            ) == 0)
+        {
+            /*
+             * Require:
+             *
+             * /upload <path>
+             */
+            if (strncmp(
+                    payload,
+                    "/upload ",
+                    8
+                ) != 0 ||
+                payload[8] == '\0')
+            {
+                safe_printf(
+                    NULL,
+                    "Usage: /upload <local-path>\n"
+                );
+
+
+                continue;
+            }
+
+
+            char upload_result[
+                MESSAGE_MAX_SIZE + 1
+            ];
+
+
+            /*
+             * upload_client_upload() sends metadata,
+             * waits for UPLOAD_READY through the
+             * receiver thread, sends binary blocks,
+             * then waits for the final upload result.
+             */
+            int upload_status =
+                upload_client_upload(
+                    client_socket,
+                    payload + 8,
+                    upload_result,
+                    sizeof(upload_result)
+                );
+
+
+            if (pthread_mutex_lock(
+                    &output_mutex
+                ) == 0)
+            {
+                if (upload_status == 0)
+                {
+                    printf(
+                        "\n[Upload] %s\n",
+                        upload_result
+                    );
+                }
+                else if (upload_status == 1)
+                {
+                    printf(
+                        "\n[Upload Error] %s\n",
+                        upload_result
+                    );
+                }
+                else
+                {
+                    printf(
+                        "\n[Upload Error] "
+                        "Connection lost during upload.\n"
+                    );
+                }
+
+
+                fflush(stdout);
+
+
+                pthread_mutex_unlock(
+                    &output_mutex
+                );
+            }
+
+
+            /*
+             * Negative result means the TCP stream
+             * can no longer be trusted.
+             */
+            if (upload_status < 0)
+            {
+                atomic_store(
+                    &client_running,
+                    0
+                );
+
+
+                shutdown(
+                    client_socket,
+                    SHUT_RDWR
+                );
+
+
+                break;
+            }
+
+
+            continue;
+        }
+
+
+        /*
+         * ------------------------------------------------
          * /msg <username> <message>
+         * ------------------------------------------------
          */
         if (strncmp(
                 payload,
@@ -895,7 +1115,7 @@ int main(void)
             ) == 0)
         {
             /*
-             * Reject malformed forms such as:
+             * Reject malformed forms:
              *
              * /msg
              * /msgBob hello
@@ -910,6 +1130,7 @@ int main(void)
                     NULL,
                     "Usage: /msg <user> <message>\n"
                 );
+
 
                 continue;
             }
@@ -935,6 +1156,7 @@ int main(void)
                     "Usage: /msg <user> <message>\n"
                 );
 
+
                 continue;
             }
 
@@ -953,6 +1175,7 @@ int main(void)
                     NULL,
                     "Invalid target username.\n"
                 );
+
 
                 continue;
             }
@@ -984,6 +1207,7 @@ int main(void)
                     "Invalid target username.\n"
                 );
 
+
                 continue;
             }
 
@@ -999,12 +1223,13 @@ int main(void)
                     "message yourself.\n"
                 );
 
+
                 continue;
             }
 
 
             /*
-             * Server receives:
+             * Payload sent to server:
              *
              * Bob Hello Bob
              */
@@ -1018,15 +1243,18 @@ int main(void)
                     "Failed to send private message.\n"
                 );
 
+
                 atomic_store(
                     &client_running,
                     0
                 );
 
+
                 shutdown(
                     client_socket,
                     SHUT_RDWR
                 );
+
 
                 break;
             }
@@ -1037,7 +1265,9 @@ int main(void)
 
 
         /*
+         * ------------------------------------------------
          * /quit
+         * ------------------------------------------------
          */
         if (strcmp(
                 payload,
@@ -1054,10 +1284,12 @@ int main(void)
                     "Failed to send disconnect request.\n"
                 );
 
+
                 atomic_store(
                     &client_running,
                     0
                 );
+
 
                 shutdown(
                     client_socket,
@@ -1067,15 +1299,20 @@ int main(void)
 
 
             /*
-             * Receiver remains alive so it can receive
-             * the server's GOODBYE response.
+             * Do not close the socket here.
+             *
+             * Receiver thread remains alive to receive:
+             *
+             *     GOODBYE
              */
             break;
         }
 
 
         /*
-         * NORMAL PUBLIC CHAT MESSAGE
+         * ------------------------------------------------
+         * NORMAL PUBLIC CHAT
+         * ------------------------------------------------
          */
         if (send_message(
                 MSG_CHAT,
@@ -1087,15 +1324,18 @@ int main(void)
                 "Failed to send chat message.\n"
             );
 
+
             atomic_store(
                 &client_running,
                 0
             );
 
+
             shutdown(
                 client_socket,
                 SHUT_RDWR
             );
+
 
             break;
         }
@@ -1103,7 +1343,7 @@ int main(void)
 
 
     /*
-     * Wait for receiver thread.
+     * Wait until the asynchronous receiver exits.
      */
     if (receiver_created)
     {
