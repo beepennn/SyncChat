@@ -12,6 +12,7 @@ CLIENT = $(BIN_DIR)/syncchat_client
 
 LOGGER_SRC = src/logger/main.c
 LOGGER_TEST_SRC = src/logger/test_client.c
+LOGGER_CLIENT_SRC = src/logger/logger_client.c
 
 NETWORK_IO_SRC = src/common/network_io.c
 PROTOCOL_SRC = src/common/protocol.c
@@ -21,6 +22,7 @@ SERVER_SRC = \
 	src/server/main.c \
 	src/server/client_handler.c \
 	$(CLIENT_MANAGER_SRC) \
+	$(LOGGER_CLIENT_SRC) \
 	$(NETWORK_IO_SRC) \
 	$(PROTOCOL_SRC)
 
@@ -50,6 +52,8 @@ server: $(SERVER)
 $(SERVER): $(SERVER_SRC) \
 	include/common/network_io.h \
 	include/common/protocol.h \
+	include/logger/logger_protocol.h \
+	include/logger/logger_client.h \
 	include/server/server_config.h \
 	include/server/client_handler.h \
 	include/server/client_manager.h
