@@ -29,3 +29,7 @@ core.*
 # Downloaded files
 downloads/*
 !downloads/.gitkeep
+
+# Python cache files
+__pycache__/
+*.py[cod]
