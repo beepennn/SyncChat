@@ -1,3 +1,4 @@
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -17,6 +18,7 @@
 #include "logger/logger_client.h"
 #include "server/client_manager.h"
 #include "server/file_manager.h"
+#include "server/file_lock.h"
 
 
 static int write_all_file(
@@ -198,7 +200,7 @@ static int parse_upload_metadata(
 }
 
 
-int file_manager_handle_upload(
+static int file_manager_handle_upload_unlocked(
     int socket_fd,
     const char *username,
     const char *metadata
@@ -617,7 +619,101 @@ int file_manager_handle_upload(
     return 0;
 }
 
-int file_manager_handle_download(
+int file_manager_handle_upload(
+    int socket_fd,
+    const char *username,
+    const char *metadata
+)
+{
+    char filename[
+        FILE_NAME_MAX_SIZE
+    ];
+
+    uint64_t file_size;
+
+    /*
+     * Preserve the existing upload validation/error
+     * behavior for malformed metadata.
+     */
+    if (parse_upload_metadata(
+            metadata,
+            filename,
+            sizeof(filename),
+            &file_size
+        ) != 0)
+    {
+        return file_manager_handle_upload_unlocked(
+            socket_fd,
+            username,
+            metadata
+        );
+    }
+
+    if (ensure_storage_directory() != 0)
+    {
+        return file_manager_handle_upload_unlocked(
+            socket_fd,
+            username,
+            metadata
+        );
+    }
+
+    /*
+     * A writer takes an exclusive per-filename OFD
+     * lock before duplicate checking and keeps it for
+     * the entire raw upload and atomic publication.
+     */
+    int lock_fd =
+        file_lock_acquire(
+            filename,
+            FILE_LOCK_EXCLUSIVE
+        );
+
+    if (lock_fd < 0)
+    {
+        client_manager_send(
+            socket_fd,
+            MSG_ERROR,
+            "FILE_LOCK_FAILED"
+        );
+
+        logger_client_log(
+            LOG_ERROR,
+            "FILE_MANAGER",
+            "Unable to acquire upload lock username=%s filename=%s error=%s",
+            username,
+            filename,
+            strerror(errno)
+        );
+
+        return 0;
+    }
+
+    int result =
+        file_manager_handle_upload_unlocked(
+            socket_fd,
+            username,
+            metadata
+        );
+
+    if (file_lock_release(
+            lock_fd
+        ) != 0)
+    {
+        logger_client_log(
+            LOG_WARN,
+            "FILE_MANAGER",
+            "Unable to release upload lock username=%s filename=%s",
+            username,
+            filename
+        );
+    }
+
+    return result;
+}
+
+
+static int file_manager_handle_download_unlocked(
     int socket_fd,
     const char *username,
     const char *filename
@@ -917,6 +1013,333 @@ int file_manager_handle_download(
         file_size
     );
 
+
+    return 0;
+}
+
+int file_manager_handle_download(
+    int socket_fd,
+    const char *username,
+    const char *filename
+)
+{
+    if (filename == NULL ||
+        !is_valid_shared_filename(
+            filename
+        ))
+    {
+        return file_manager_handle_download_unlocked(
+            socket_fd,
+            username,
+            filename
+        );
+    }
+
+    if (ensure_storage_directory() != 0)
+    {
+        client_manager_send(
+            socket_fd,
+            MSG_ERROR,
+            "STORAGE_UNAVAILABLE"
+        );
+
+        logger_client_log(
+            LOG_ERROR,
+            "FILE_MANAGER",
+            "Storage directory unavailable during download"
+        );
+
+        return 0;
+    }
+
+    /*
+     * Readers use a shared OFD lock. Multiple
+     * downloads of the same file may proceed together,
+     * while an upload/writer for the same filename
+     * must wait.
+     */
+    int lock_fd =
+        file_lock_acquire(
+            filename,
+            FILE_LOCK_SHARED
+        );
+
+    if (lock_fd < 0)
+    {
+        client_manager_send(
+            socket_fd,
+            MSG_ERROR,
+            "FILE_LOCK_FAILED"
+        );
+
+        logger_client_log(
+            LOG_ERROR,
+            "FILE_MANAGER",
+            "Unable to acquire download lock username=%s filename=%s error=%s",
+            username,
+            filename,
+            strerror(errno)
+        );
+
+        return 0;
+    }
+
+    int result =
+        file_manager_handle_download_unlocked(
+            socket_fd,
+            username,
+            filename
+        );
+
+    if (file_lock_release(
+            lock_fd
+        ) != 0)
+    {
+        logger_client_log(
+            LOG_WARN,
+            "FILE_MANAGER",
+            "Unable to release download lock username=%s filename=%s",
+            username,
+            filename
+        );
+    }
+
+    return result;
+}
+
+
+int file_manager_handle_list(
+    int socket_fd,
+    const char *username
+)
+{
+    if (username == NULL)
+    {
+        return -1;
+    }
+
+    if (ensure_storage_directory() != 0)
+    {
+        client_manager_send(
+            socket_fd,
+            MSG_ERROR,
+            "STORAGE_UNAVAILABLE"
+        );
+
+        return 0;
+    }
+
+    int directory_fd =
+        open(
+            FILE_STORAGE_DIRECTORY,
+            O_RDONLY |
+            O_DIRECTORY |
+            O_CLOEXEC
+        );
+
+    if (directory_fd < 0)
+    {
+        client_manager_send(
+            socket_fd,
+            MSG_ERROR,
+            "FILE_LIST_OPEN_FAILED"
+        );
+
+        logger_client_log(
+            LOG_ERROR,
+            "FILE_MANAGER",
+            "Unable to open storage directory for listing error=%s",
+            strerror(errno)
+        );
+
+        return 0;
+    }
+
+    DIR *directory =
+        fdopendir(
+            directory_fd
+        );
+
+    if (directory == NULL)
+    {
+        close(directory_fd);
+
+        client_manager_send(
+            socket_fd,
+            MSG_ERROR,
+            "FILE_LIST_OPEN_FAILED"
+        );
+
+        return 0;
+    }
+
+    if (client_manager_send(
+            socket_fd,
+            MSG_RESPONSE,
+            "FILE_LIST_BEGIN"
+        ) != 0)
+    {
+        closedir(directory);
+
+        return -1;
+    }
+
+    int file_count = 0;
+    int list_failed = 0;
+
+    errno = 0;
+
+    while (1)
+    {
+        struct dirent *entry =
+            readdir(directory);
+
+        if (entry == NULL)
+        {
+            if (errno != 0)
+            {
+                list_failed = 1;
+            }
+
+            break;
+        }
+
+        /*
+         * Filename validation automatically excludes
+         * .gitkeep, .locks, upload temporary files,
+         * traversal-like names, and unsupported names.
+         */
+        if (!is_valid_shared_filename(
+                entry->d_name
+            ))
+        {
+            continue;
+        }
+
+        struct stat information;
+
+        if (fstatat(
+                directory_fd,
+                entry->d_name,
+                &information,
+                AT_SYMLINK_NOFOLLOW
+            ) != 0)
+        {
+            continue;
+        }
+
+        if (!S_ISREG(
+                information.st_mode
+            ) ||
+            information.st_size < 0)
+        {
+            continue;
+        }
+
+        uint64_t file_size =
+            (uint64_t)information.st_size;
+
+        if (file_size >
+            FILE_MAX_SIZE)
+        {
+            continue;
+        }
+
+        char file_entry[
+            FILE_NAME_MAX_SIZE + 64
+        ];
+
+        int written =
+            snprintf(
+                file_entry,
+                sizeof(file_entry),
+                "%s|%" PRIu64,
+                entry->d_name,
+                file_size
+            );
+
+        if (written < 0 ||
+            (size_t)written >=
+                sizeof(file_entry))
+        {
+            continue;
+        }
+
+        if (client_manager_send(
+                socket_fd,
+                MSG_FILELIST,
+                file_entry
+            ) != 0)
+        {
+            closedir(directory);
+
+            return -1;
+        }
+
+        file_count++;
+    }
+
+    if (closedir(
+            directory
+        ) != 0)
+    {
+        list_failed = 1;
+    }
+
+    if (list_failed)
+    {
+        if (client_manager_send(
+                socket_fd,
+                MSG_ERROR,
+                "FILE_LIST_READ_FAILED"
+            ) != 0)
+        {
+            return -1;
+        }
+
+        logger_client_log(
+            LOG_ERROR,
+            "FILE_MANAGER",
+            "Shared file listing failed requester=%s",
+            username
+        );
+
+        return 0;
+    }
+
+    char end_message[64];
+
+    int end_written =
+        snprintf(
+            end_message,
+            sizeof(end_message),
+            "FILE_LIST_END %d",
+            file_count
+        );
+
+    if (end_written < 0 ||
+        (size_t)end_written >=
+            sizeof(end_message))
+    {
+        return -1;
+    }
+
+    if (client_manager_send(
+            socket_fd,
+            MSG_RESPONSE,
+            end_message
+        ) != 0)
+    {
+        return -1;
+    }
+
+    logger_client_log(
+        LOG_DEBUG,
+        "FILE_MANAGER",
+        "Shared file list requested username=%s count=%d",
+        username,
+        file_count
+    );
 
     return 0;
 }

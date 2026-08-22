@@ -1028,11 +1028,17 @@ void *client_handler(
 
             case MSG_LIST_FILES:
             {
-                client_manager_send(
-                    socket_fd,
-                    MSG_ERROR,
-                    "LIST_FILES_NOT_IMPLEMENTED"
-                );
+                int list_result =
+                    file_manager_handle_list(
+                        socket_fd,
+                        username
+                    );
+
+
+                if (list_result < 0)
+                {
+                    goto connection_end;
+                }
 
 
                 break;
@@ -1064,6 +1070,7 @@ void *client_handler(
             case MSG_ERROR:
             case MSG_BROADCAST:
             case MSG_USERLIST:
+            case MSG_FILELIST:
             {
                 client_manager_send(
                     socket_fd,

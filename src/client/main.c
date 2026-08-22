@@ -377,6 +377,9 @@ static void *receiver_thread(
 
     uint32_t message_type;
 
+    int file_list_active = 0;
+    int file_list_count = 0;
+
 
     while (atomic_load(
             &client_running
@@ -619,6 +622,42 @@ static void *receiver_thread(
              */
             case MSG_RESPONSE:
             {
+                if (strcmp(
+                        payload,
+                        "FILE_LIST_BEGIN"
+                    ) == 0)
+                {
+                    file_list_active = 1;
+                    file_list_count = 0;
+
+                    printf(
+                        "[Shared Files]\n"
+                    );
+
+                    break;
+                }
+
+
+                if (strncmp(
+                        payload,
+                        "FILE_LIST_END ",
+                        14
+                    ) == 0)
+                {
+                    if (file_list_active &&
+                        file_list_count == 0)
+                    {
+                        printf(
+                            "  (none)\n"
+                        );
+                    }
+
+                    file_list_active = 0;
+
+                    break;
+                }
+
+
                 printf(
                     "[Server] %s\n",
                     payload
@@ -665,6 +704,53 @@ static void *receiver_thread(
                     "%s\n",
                     payload
                 );
+
+                break;
+            }
+
+
+            /*
+             * One shared-file entry:
+             *
+             *     filename|size
+             */
+            case MSG_FILELIST:
+            {
+                const char *separator =
+                    strrchr(
+                        payload,
+                        '|'
+                    );
+
+
+                if (separator != NULL &&
+                    separator != payload &&
+                    separator[1] != '\0')
+                {
+                    printf(
+                        "  %.*s (%s bytes)\n",
+                        (int)(
+                            separator -
+                            payload
+                        ),
+                        payload,
+                        separator + 1
+                    );
+                }
+                else
+                {
+                    printf(
+                        "  %s\n",
+                        payload
+                    );
+                }
+
+
+                if (file_list_active)
+                {
+                    file_list_count++;
+                }
+
 
                 break;
             }
@@ -941,6 +1027,7 @@ int main(void)
     printf(
         "Commands:\n"
         "  /users\n"
+        "  /files\n"
         "  /msg <user> <message>\n"
         "  /upload <local-path>\n"
         "  /download <filename>\n"
@@ -1084,6 +1171,47 @@ int main(void)
                 fprintf(
                     stderr,
                     "Failed to request online users.\n"
+                );
+
+
+                atomic_store(
+                    &client_running,
+                    0
+                );
+
+
+                shutdown(
+                    client_socket,
+                    SHUT_RDWR
+                );
+
+
+                break;
+            }
+
+
+            continue;
+        }
+
+
+        /*
+         * =================================================
+         * /files
+         * =================================================
+         */
+        if (strcmp(
+                payload,
+                "/files"
+            ) == 0)
+        {
+            if (send_message(
+                    MSG_LIST_FILES,
+                    ""
+                ) != 0)
+            {
+                fprintf(
+                    stderr,
+                    "Failed to request shared files.\n"
                 );
 
 

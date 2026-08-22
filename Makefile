@@ -20,6 +20,7 @@ FILE_TRANSFER_SRC = src/common/file_transfer.c
 
 CLIENT_MANAGER_SRC = src/server/client_manager.c
 FILE_MANAGER_SRC = src/server/file_manager.c
+FILE_LOCK_SRC = src/server/file_lock.c
 
 UPLOAD_CLIENT_SRC = src/client/upload_client.c
 DOWNLOAD_CLIENT_SRC = src/client/download_client.c
@@ -30,6 +31,7 @@ SERVER_SRC = \
 	src/server/client_handler.c \
 	$(CLIENT_MANAGER_SRC) \
 	$(FILE_MANAGER_SRC) \
+	$(FILE_LOCK_SRC) \
 	$(LOGGER_CLIENT_SRC) \
 	$(NETWORK_IO_SRC) \
 	$(PROTOCOL_SRC) \
@@ -70,7 +72,8 @@ $(SERVER): $(SERVER_SRC) \
 	include/server/server_config.h \
 	include/server/client_handler.h \
 	include/server/client_manager.h \
-	include/server/file_manager.h
+	include/server/file_manager.h \
+	include/server/file_lock.h
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) $(SERVER_SRC) -pthread -o $(SERVER)
 

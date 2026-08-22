@@ -40,6 +40,12 @@
  */
 #define MSG_PRIVATE      12
 
+/*
+ * Server -> Client:
+ *     one shared-file entry as "filename|size"
+ */
+#define MSG_FILELIST     13
+
 
 typedef struct
 {

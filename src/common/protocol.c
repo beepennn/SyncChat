@@ -21,6 +21,7 @@ int is_valid_message_type(uint32_t type)
         case MSG_USERLIST:
         case MSG_LIST_USERS:
         case MSG_PRIVATE:
+        case MSG_FILELIST:
             return 1;
 
         default:

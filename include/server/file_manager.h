@@ -27,4 +27,14 @@ int file_manager_handle_download(
     const char *filename
 );
 
+
+/*
+ * Send the current list of completed, downloadable
+ * regular files to one client.
+ */
+int file_manager_handle_list(
+    int socket_fd,
+    const char *username
+);
+
 #endif
