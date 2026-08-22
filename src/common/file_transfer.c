@@ -14,8 +14,10 @@ int is_valid_shared_filename(
         return 0;
     }
 
+
     size_t length =
         strlen(filename);
+
 
     if (length == 0 ||
         length >= FILE_NAME_MAX_SIZE)
@@ -23,26 +25,38 @@ int is_valid_shared_filename(
         return 0;
     }
 
-    /*
-     * Do not allow hidden files, "." or "..".
-     */
-    if (filename[0] == '.')
-    {
-        return 0;
-    }
 
     /*
-     * First character must be an alphanumeric
-     * character or underscore.
+     * Shared files cannot be hidden and cannot begin
+     * with punctuation.
      */
     unsigned char first =
         (unsigned char)filename[0];
 
+
     if (!isalnum(first) &&
-        first != '_')
+        filename[0] != '_')
     {
         return 0;
     }
+
+
+    /*
+     * Reject traversal-like dot-dot sequences even
+     * though path separators are independently banned.
+     *
+     * This intentionally uses a stricter policy than
+     * Linux itself because SyncChat only needs simple
+     * shared basenames.
+     */
+    if (strstr(
+            filename,
+            ".."
+        ) != NULL)
+    {
+        return 0;
+    }
+
 
     for (size_t i = 0;
          i < length;
@@ -50,6 +64,7 @@ int is_valid_shared_filename(
     {
         unsigned char character =
             (unsigned char)filename[i];
+
 
         if (!isalnum(character) &&
             character != '_' &&
@@ -59,6 +74,7 @@ int is_valid_shared_filename(
             return 0;
         }
     }
+
 
     return 1;
 }

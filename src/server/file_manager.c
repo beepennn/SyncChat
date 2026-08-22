@@ -2,7 +2,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
-#include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -17,8 +16,8 @@
 #include "common/protocol.h"
 #include "logger/logger_client.h"
 #include "server/client_manager.h"
-#include "server/file_manager.h"
 #include "server/file_lock.h"
+#include "server/file_manager.h"
 
 
 static int write_all_file(
@@ -32,13 +31,16 @@ static int write_all_file(
 
     size_t written_total = 0;
 
+
     while (written_total < length)
     {
-        ssize_t written = write(
-            file_fd,
-            bytes + written_total,
-            length - written_total
-        );
+        ssize_t written =
+            write(
+                file_fd,
+                bytes + written_total,
+                length - written_total
+            );
+
 
         if (written < 0)
         {
@@ -47,17 +49,42 @@ static int write_all_file(
                 continue;
             }
 
+
             return -1;
         }
 
+
         if (written == 0)
         {
+            errno = EIO;
+
             return -1;
         }
+
 
         written_total +=
             (size_t)written;
     }
+
+
+    return 0;
+}
+
+
+static int send_error(
+    int socket_fd,
+    const char *message
+)
+{
+    if (client_manager_send(
+            socket_fd,
+            MSG_ERROR,
+            message
+        ) != 0)
+    {
+        return -1;
+    }
+
 
     return 0;
 }
@@ -67,7 +94,13 @@ static int ensure_storage_directory(void)
 {
     struct stat information;
 
-    if (stat(
+
+    /*
+     * lstat() intentionally does not follow symbolic
+     * links. The top-level shared storage path must be
+     * a real directory, not a redirect elsewhere.
+     */
+    if (lstat(
             FILE_STORAGE_DIRECTORY,
             &information
         ) == 0)
@@ -76,29 +109,119 @@ static int ensure_storage_directory(void)
                 information.st_mode
             ))
         {
+            errno = ENOTDIR;
+
             return -1;
         }
 
+
         return 0;
     }
+
 
     if (errno != ENOENT)
     {
         return -1;
     }
 
+
     if (mkdir(
             FILE_STORAGE_DIRECTORY,
             0755
-        ) != 0)
+        ) != 0 &&
+        errno != EEXIST)
     {
-        if (errno != EEXIST)
-        {
-            return -1;
-        }
+        return -1;
     }
 
+
+    /*
+     * Re-check after creation in case another actor
+     * raced with mkdir().
+     */
+    if (lstat(
+            FILE_STORAGE_DIRECTORY,
+            &information
+        ) != 0)
+    {
+        return -1;
+    }
+
+
+    if (!S_ISDIR(
+            information.st_mode
+        ))
+    {
+        errno = ENOTDIR;
+
+        return -1;
+    }
+
+
     return 0;
+}
+
+
+static int open_storage_directory(void)
+{
+    int flags =
+        O_RDONLY |
+        O_DIRECTORY |
+        O_CLOEXEC;
+
+
+#ifdef O_NOFOLLOW
+    flags |=
+        O_NOFOLLOW;
+#endif
+
+
+    int directory_fd =
+        open(
+            FILE_STORAGE_DIRECTORY,
+            flags
+        );
+
+
+    if (directory_fd < 0)
+    {
+        return -1;
+    }
+
+
+    struct stat information;
+
+
+    if (fstat(
+            directory_fd,
+            &information
+        ) != 0 ||
+        !S_ISDIR(
+            information.st_mode
+        ))
+    {
+        int saved_errno =
+            errno;
+
+
+        if (saved_errno == 0)
+        {
+            saved_errno =
+                ENOTDIR;
+        }
+
+
+        close(directory_fd);
+
+        errno =
+            saved_errno;
+
+
+        return -1;
+    }
+
+
+    return directory_fd;
 }
 
 
@@ -117,18 +240,16 @@ static int parse_upload_metadata(
         return -1;
     }
 
+
     const char *separator =
-        strchr(metadata, '|');
+        strchr(
+            metadata,
+            '|'
+        );
 
-    if (separator == NULL)
-    {
-        return -1;
-    }
 
-    /*
-     * Only one separator is allowed.
-     */
-    if (strchr(
+    if (separator == NULL ||
+        strchr(
             separator + 1,
             '|'
         ) != NULL)
@@ -136,16 +257,21 @@ static int parse_upload_metadata(
         return -1;
     }
 
+
     size_t name_length =
         (size_t)(
-            separator - metadata
+            separator -
+            metadata
         );
 
+
     if (name_length == 0 ||
-        name_length >= filename_size)
+        name_length >=
+            filename_size)
     {
         return -1;
     }
+
 
     memcpy(
         filename,
@@ -153,7 +279,11 @@ static int parse_upload_metadata(
         name_length
     );
 
-    filename[name_length] = '\0';
+
+    filename[
+        name_length
+    ] = '\0';
+
 
     if (!is_valid_shared_filename(
             filename
@@ -162,17 +292,22 @@ static int parse_upload_metadata(
         return -1;
     }
 
+
     const char *size_text =
         separator + 1;
+
 
     if (*size_text == '\0')
     {
         return -1;
     }
 
+
     errno = 0;
 
+
     char *end_pointer = NULL;
+
 
     unsigned long long parsed =
         strtoull(
@@ -181,26 +316,56 @@ static int parse_upload_metadata(
             10
         );
 
+
     if (errno != 0 ||
         end_pointer == size_text ||
-        *end_pointer != '\0')
+        *end_pointer != '\0' ||
+        parsed > FILE_MAX_SIZE)
     {
         return -1;
     }
 
-    if (parsed > FILE_MAX_SIZE)
-    {
-        return -1;
-    }
 
     *file_size =
         (uint64_t)parsed;
+
 
     return 0;
 }
 
 
-static int file_manager_handle_upload_unlocked(
+static int build_upload_temp_name(
+    int socket_fd,
+    char *buffer,
+    size_t buffer_size
+)
+{
+    int written =
+        snprintf(
+            buffer,
+            buffer_size,
+            ".upload-%ld-%d-%lu.tmp",
+            (long)getpid(),
+            socket_fd,
+            (unsigned long)pthread_self()
+        );
+
+
+    if (written < 0 ||
+        (size_t)written >=
+            buffer_size)
+    {
+        errno = ENAMETOOLONG;
+
+        return -1;
+    }
+
+
+    return 0;
+}
+
+
+int file_manager_handle_upload(
     int socket_fd,
     const char *username,
     const char *metadata
@@ -213,6 +378,12 @@ static int file_manager_handle_upload_unlocked(
     uint64_t file_size;
 
 
+    if (username == NULL)
+    {
+        return -1;
+    }
+
+
     if (parse_upload_metadata(
             metadata,
             filename,
@@ -220,161 +391,248 @@ static int file_manager_handle_upload_unlocked(
             &file_size
         ) != 0)
     {
-        client_manager_send(
-            socket_fd,
-            MSG_ERROR,
-            "INVALID_UPLOAD_METADATA"
-        );
-
         logger_client_log(
             LOG_WARN,
-            "FILE_MANAGER",
-            "Invalid upload metadata username=%s",
+            "SECURITY",
+            "Rejected upload metadata username=%s",
             username
         );
 
-        return 0;
+
+        return send_error(
+            socket_fd,
+            "INVALID_UPLOAD_METADATA"
+        );
     }
 
 
     if (ensure_storage_directory() != 0)
     {
-        client_manager_send(
+        logger_client_log(
+            LOG_ERROR,
+            "FILE_MANAGER",
+            "Storage directory unavailable during upload error=%s",
+            strerror(errno)
+        );
+
+
+        return send_error(
             socket_fd,
-            MSG_ERROR,
             "STORAGE_UNAVAILABLE"
         );
+    }
 
+
+    int lock_fd =
+        file_lock_acquire(
+            filename,
+            FILE_LOCK_EXCLUSIVE
+        );
+
+
+    if (lock_fd < 0)
+    {
         logger_client_log(
             LOG_ERROR,
             "FILE_MANAGER",
-            "Storage directory unavailable"
-        );
-
-        return 0;
-    }
-
-
-    char final_path[PATH_MAX];
-
-    int path_written =
-        snprintf(
-            final_path,
-            sizeof(final_path),
-            "%s/%s",
-            FILE_STORAGE_DIRECTORY,
-            filename
-        );
-
-    if (path_written < 0 ||
-        (size_t)path_written >=
-            sizeof(final_path))
-    {
-        client_manager_send(
-            socket_fd,
-            MSG_ERROR,
-            "INVALID_FILE_PATH"
-        );
-
-        return 0;
-    }
-
-
-    /*
-     * Fast duplicate check.
-     *
-     * The final atomic link() still protects
-     * against races between simultaneous uploads.
-     */
-    if (access(
-            final_path,
-            F_OK
-        ) == 0)
-    {
-        client_manager_send(
-            socket_fd,
-            MSG_ERROR,
-            "FILE_ALREADY_EXISTS"
-        );
-
-        return 0;
-    }
-
-
-    /*
-     * Upload to a hidden temporary file first.
-     *
-     * This prevents incomplete files from appearing
-     * as normal shared files.
-     */
-    char temporary_path[
-        PATH_MAX
-    ];
-
-    int temporary_written =
-        snprintf(
-            temporary_path,
-            sizeof(temporary_path),
-            "%s/.upload-%ld-%d-%lu.tmp",
-            FILE_STORAGE_DIRECTORY,
-            (long)getpid(),
-            socket_fd,
-            (unsigned long)pthread_self()
-        );
-
-    if (temporary_written < 0 ||
-        (size_t)temporary_written >=
-            sizeof(temporary_path))
-    {
-        client_manager_send(
-            socket_fd,
-            MSG_ERROR,
-            "UPLOAD_TEMP_PATH_FAILED"
-        );
-
-        return 0;
-    }
-
-
-    /*
-     * Remove a stale temporary file from an
-     * abnormal previous termination if necessary.
-     */
-    unlink(temporary_path);
-
-
-    int file_fd = open(
-        temporary_path,
-        O_WRONLY |
-        O_CREAT |
-        O_EXCL,
-        0600
-    );
-
-    if (file_fd < 0)
-    {
-        client_manager_send(
-            socket_fd,
-            MSG_ERROR,
-            "UPLOAD_CREATE_FAILED"
-        );
-
-        logger_client_log(
-            LOG_ERROR,
-            "FILE_MANAGER",
-            "Failed to create upload temp file filename=%s error=%s",
+            "Unable to acquire upload lock username=%s filename=%s error=%s",
+            username,
             filename,
             strerror(errno)
         );
 
-        return 0;
+
+        return send_error(
+            socket_fd,
+            "FILE_LOCK_FAILED"
+        );
+    }
+
+
+    int result = 0;
+
+    int storage_fd = -1;
+    int file_fd = -1;
+
+    int temp_created = 0;
+
+
+    char temporary_name[
+        FILE_NAME_MAX_SIZE
+    ];
+
+
+    storage_fd =
+        open_storage_directory();
+
+
+    if (storage_fd < 0)
+    {
+        logger_client_log(
+            LOG_ERROR,
+            "SECURITY",
+            "Secure storage open failed during upload error=%s",
+            strerror(errno)
+        );
+
+
+        result =
+            send_error(
+                socket_fd,
+                "STORAGE_UNAVAILABLE"
+            );
+
+
+        goto upload_cleanup;
     }
 
 
     /*
-     * The server has accepted the metadata.
-     * Only now may the client begin sending raw
-     * binary file blocks.
+     * Check the destination without following a
+     * symbolic link.
+     */
+    struct stat destination_information;
+
+
+    if (fstatat(
+            storage_fd,
+            filename,
+            &destination_information,
+            AT_SYMLINK_NOFOLLOW
+        ) == 0)
+    {
+        result =
+            send_error(
+                socket_fd,
+                "FILE_ALREADY_EXISTS"
+            );
+
+
+        goto upload_cleanup;
+    }
+
+
+    if (errno != ENOENT)
+    {
+        logger_client_log(
+            LOG_ERROR,
+            "FILE_MANAGER",
+            "Upload destination check failed filename=%s error=%s",
+            filename,
+            strerror(errno)
+        );
+
+
+        result =
+            send_error(
+                socket_fd,
+                "UPLOAD_DESTINATION_CHECK_FAILED"
+            );
+
+
+        goto upload_cleanup;
+    }
+
+
+    if (build_upload_temp_name(
+            socket_fd,
+            temporary_name,
+            sizeof(temporary_name)
+        ) != 0)
+    {
+        result =
+            send_error(
+                socket_fd,
+                "UPLOAD_TEMP_PATH_FAILED"
+            );
+
+
+        goto upload_cleanup;
+    }
+
+
+    /*
+     * Remove only the exact internal temporary name
+     * inside the already-open storage directory.
+     */
+    if (unlinkat(
+            storage_fd,
+            temporary_name,
+            0
+        ) != 0 &&
+        errno != ENOENT)
+    {
+        logger_client_log(
+            LOG_ERROR,
+            "FILE_MANAGER",
+            "Unable to clear stale upload temp filename=%s error=%s",
+            filename,
+            strerror(errno)
+        );
+
+
+        result =
+            send_error(
+                socket_fd,
+                "UPLOAD_TEMP_CLEANUP_FAILED"
+            );
+
+
+        goto upload_cleanup;
+    }
+
+
+    int open_flags =
+        O_WRONLY |
+        O_CREAT |
+        O_EXCL |
+        O_CLOEXEC;
+
+
+#ifdef O_NOFOLLOW
+    open_flags |=
+        O_NOFOLLOW;
+#endif
+
+
+    file_fd =
+        openat(
+            storage_fd,
+            temporary_name,
+            open_flags,
+            0600
+        );
+
+
+    if (file_fd < 0)
+    {
+        logger_client_log(
+            LOG_ERROR,
+            "FILE_MANAGER",
+            "Failed to create upload temp filename=%s error=%s",
+            filename,
+            strerror(errno)
+        );
+
+
+        result =
+            send_error(
+                socket_fd,
+                "UPLOAD_CREATE_FAILED"
+            );
+
+
+        goto upload_cleanup;
+    }
+
+
+    temp_created = 1;
+
+
+    /*
+     * Raw bytes are accepted only after the server has
+     * successfully validated metadata, locked the name,
+     * opened storage safely, and created the temp file.
      */
     if (client_manager_send(
             socket_fd,
@@ -382,16 +640,16 @@ static int file_manager_handle_upload_unlocked(
             "UPLOAD_READY"
         ) != 0)
     {
-        close(file_fd);
-        unlink(temporary_path);
+        result = -1;
 
-        return -1;
+        goto upload_cleanup;
     }
 
 
     unsigned char buffer[
         FILE_CHUNK_SIZE
     ];
+
 
     uint64_t remaining =
         file_size;
@@ -401,19 +659,10 @@ static int file_manager_handle_upload_unlocked(
 
     while (remaining > 0)
     {
-        size_t chunk_size;
-
-        if (remaining >
-            FILE_CHUNK_SIZE)
-        {
-            chunk_size =
-                FILE_CHUNK_SIZE;
-        }
-        else
-        {
-            chunk_size =
-                (size_t)remaining;
-        }
+        size_t chunk_size =
+            remaining > FILE_CHUNK_SIZE
+                ? FILE_CHUNK_SIZE
+                : (size_t)remaining;
 
 
         int receive_result =
@@ -423,38 +672,54 @@ static int file_manager_handle_upload_unlocked(
                 chunk_size
             );
 
+
         if (receive_result != 0)
         {
-            close(file_fd);
-            unlink(temporary_path);
-
+            /*
+             * The promised byte sequence was not
+             * completed. The TCP application stream can
+             * no longer be trusted, so the connection is
+             * terminated by the caller.
+             */
             logger_client_log(
                 LOG_WARN,
                 "FILE_MANAGER",
-                "Upload interrupted username=%s filename=%s",
+                "Upload interrupted username=%s filename=%s remaining=%" PRIu64,
                 username,
-                filename
+                filename,
+                remaining
             );
 
-            return -1;
+
+            result = -1;
+
+            goto upload_cleanup;
         }
 
 
         /*
-         * If the local write fails, continue reading
-         * the remaining bytes from TCP so application
-         * framing remains synchronized.
+         * A local disk failure does NOT immediately stop
+         * socket reception. Drain all promised bytes so
+         * the next application frame remains aligned.
          */
-        if (!write_failed)
+        if (!write_failed &&
+            write_all_file(
+                file_fd,
+                buffer,
+                chunk_size
+            ) != 0)
         {
-            if (write_all_file(
-                    file_fd,
-                    buffer,
-                    chunk_size
-                ) != 0)
-            {
-                write_failed = 1;
-            }
+            write_failed = 1;
+
+
+            logger_client_log(
+                LOG_ERROR,
+                "FILE_MANAGER",
+                "Upload write failed username=%s filename=%s error=%s",
+                username,
+                filename,
+                strerror(errno)
+            );
         }
 
 
@@ -463,90 +728,77 @@ static int file_manager_handle_upload_unlocked(
     }
 
 
-    if (!write_failed)
-    {
-        if (fsync(file_fd) != 0)
-        {
-            write_failed = 1;
-        }
-    }
-
-
-    if (!write_failed)
-    {
-        if (fchmod(
-                file_fd,
-                0644
-            ) != 0)
-        {
-            write_failed = 1;
-        }
-    }
-
-
-    if (close(file_fd) != 0)
+    if (!write_failed &&
+        fsync(
+            file_fd
+        ) != 0)
     {
         write_failed = 1;
     }
 
 
+    if (!write_failed &&
+        fchmod(
+            file_fd,
+            0644
+        ) != 0)
+    {
+        write_failed = 1;
+    }
+
+
+    if (close(
+            file_fd
+        ) != 0)
+    {
+        write_failed = 1;
+    }
+
+
+    file_fd = -1;
+
+
     if (write_failed)
     {
-        unlink(temporary_path);
+        result =
+            send_error(
+                socket_fd,
+                "UPLOAD_WRITE_FAILED"
+            );
 
-        client_manager_send(
-            socket_fd,
-            MSG_ERROR,
-            "UPLOAD_WRITE_FAILED"
-        );
 
-        logger_client_log(
-            LOG_ERROR,
-            "FILE_MANAGER",
-            "Upload write failed username=%s filename=%s",
-            username,
-            filename
-        );
-
-        return 0;
+        goto upload_cleanup;
     }
 
 
     /*
-     * link() publishes the completed file without
-     * overwriting an existing destination.
-     *
-     * This is atomic within the same filesystem.
+     * Publish atomically inside the same storage
+     * directory and never overwrite an existing entry.
      */
-    if (link(
-            temporary_path,
-            final_path
+    if (linkat(
+            storage_fd,
+            temporary_name,
+            storage_fd,
+            filename,
+            0
         ) != 0)
     {
         int saved_errno =
             errno;
 
-        unlink(
-            temporary_path
-        );
 
         if (saved_errno == EEXIST)
         {
-            client_manager_send(
-                socket_fd,
-                MSG_ERROR,
-                "FILE_ALREADY_EXISTS"
-            );
+            result =
+                send_error(
+                    socket_fd,
+                    "FILE_ALREADY_EXISTS"
+                );
 
-            return 0;
+
+            goto upload_cleanup;
         }
 
-
-        client_manager_send(
-            socket_fd,
-            MSG_ERROR,
-            "UPLOAD_FINALIZE_FAILED"
-        );
 
         logger_client_log(
             LOG_ERROR,
@@ -556,23 +808,38 @@ static int file_manager_handle_upload_unlocked(
             strerror(saved_errno)
         );
 
-        return 0;
+
+        result =
+            send_error(
+                socket_fd,
+                "UPLOAD_FINALIZE_FAILED"
+            );
+
+
+        goto upload_cleanup;
     }
 
 
     /*
-     * Remove the temporary hard-link name.
-     * The final filename remains.
+     * The completed file is now published. Remove the
+     * hidden temporary hard-link name.
      */
-    if (unlink(
-            temporary_path
-        ) != 0)
+    if (unlinkat(
+            storage_fd,
+            temporary_name,
+            0
+        ) == 0)
+    {
+        temp_created = 0;
+    }
+    else
     {
         logger_client_log(
             LOG_WARN,
             "FILE_MANAGER",
-            "Unable to remove temporary upload path filename=%s",
-            filename
+            "Unable to remove upload temp link filename=%s error=%s",
+            filename,
+            strerror(errno)
         );
     }
 
@@ -580,6 +847,7 @@ static int file_manager_handle_upload_unlocked(
     char response[
         FILE_NAME_MAX_SIZE + 64
     ];
+
 
     int response_written =
         snprintf(
@@ -595,15 +863,31 @@ static int file_manager_handle_upload_unlocked(
         (size_t)response_written >=
             sizeof(response))
     {
-        return -1;
+        result = -1;
+
+        goto upload_cleanup;
     }
 
 
-    client_manager_send(
-        socket_fd,
-        MSG_RESPONSE,
-        response
-    );
+    if (client_manager_send(
+            socket_fd,
+            MSG_RESPONSE,
+            response
+        ) != 0)
+    {
+        logger_client_log(
+            LOG_WARN,
+            "FILE_MANAGER",
+            "Upload stored but success response failed username=%s filename=%s",
+            username,
+            filename
+        );
+
+
+        result = -1;
+
+        goto upload_cleanup;
+    }
 
 
     logger_client_log(
@@ -616,85 +900,59 @@ static int file_manager_handle_upload_unlocked(
     );
 
 
-    return 0;
-}
+upload_cleanup:
 
-int file_manager_handle_upload(
-    int socket_fd,
-    const char *username,
-    const char *metadata
-)
-{
-    char filename[
-        FILE_NAME_MAX_SIZE
-    ];
-
-    uint64_t file_size;
-
-    /*
-     * Preserve the existing upload validation/error
-     * behavior for malformed metadata.
-     */
-    if (parse_upload_metadata(
-            metadata,
-            filename,
-            sizeof(filename),
-            &file_size
-        ) != 0)
+    if (file_fd >= 0)
     {
-        return file_manager_handle_upload_unlocked(
-            socket_fd,
-            username,
-            metadata
-        );
+        if (close(
+                file_fd
+            ) != 0)
+        {
+            logger_client_log(
+                LOG_WARN,
+                "FILE_MANAGER",
+                "Upload temp close failed filename=%s",
+                filename
+            );
+        }
     }
 
-    if (ensure_storage_directory() != 0)
+
+    if (temp_created &&
+        storage_fd >= 0)
     {
-        return file_manager_handle_upload_unlocked(
-            socket_fd,
-            username,
-            metadata
-        );
+        if (unlinkat(
+                storage_fd,
+                temporary_name,
+                0
+            ) != 0 &&
+            errno != ENOENT)
+        {
+            logger_client_log(
+                LOG_WARN,
+                "FILE_MANAGER",
+                "Upload temp cleanup failed filename=%s error=%s",
+                filename,
+                strerror(errno)
+            );
+        }
     }
 
-    /*
-     * A writer takes an exclusive per-filename OFD
-     * lock before duplicate checking and keeps it for
-     * the entire raw upload and atomic publication.
-     */
-    int lock_fd =
-        file_lock_acquire(
-            filename,
-            FILE_LOCK_EXCLUSIVE
-        );
 
-    if (lock_fd < 0)
+    if (storage_fd >= 0)
     {
-        client_manager_send(
-            socket_fd,
-            MSG_ERROR,
-            "FILE_LOCK_FAILED"
-        );
-
-        logger_client_log(
-            LOG_ERROR,
-            "FILE_MANAGER",
-            "Unable to acquire upload lock username=%s filename=%s error=%s",
-            username,
-            filename,
-            strerror(errno)
-        );
-
-        return 0;
+        if (close(
+                storage_fd
+            ) != 0)
+        {
+            logger_client_log(
+                LOG_WARN,
+                "FILE_MANAGER",
+                "Storage directory close failed after upload"
+            );
+        }
     }
 
-    int result =
-        file_manager_handle_upload_unlocked(
-            socket_fd,
-            username,
-            metadata
-        );
 
     if (file_lock_release(
             lock_fd
@@ -709,137 +967,195 @@ int file_manager_handle_upload(
         );
     }
 
+
     return result;
 }
 
 
-static int file_manager_handle_download_unlocked(
+int file_manager_handle_download(
     int socket_fd,
     const char *username,
     const char *filename
 )
 {
-    if (username == NULL ||
-        filename == NULL)
+    if (username == NULL)
     {
         return -1;
     }
 
 
-    /*
-     * The filename validator disallows:
-     *
-     * ../
-     * /
-     * backslashes
-     * hidden names
-     * control characters
-     */
-    if (!is_valid_shared_filename(
+    if (filename == NULL ||
+        !is_valid_shared_filename(
             filename
         ))
     {
-        client_manager_send(
-            socket_fd,
-            MSG_ERROR,
-            "INVALID_DOWNLOAD_FILENAME"
-        );
-
-
         logger_client_log(
             LOG_WARN,
-            "FILE_MANAGER",
-            "Invalid download filename username=%s",
+            "SECURITY",
+            "Rejected download filename username=%s",
             username
         );
 
 
-        return 0;
-    }
-
-
-    char file_path[
-        PATH_MAX
-    ];
-
-
-    int path_written =
-        snprintf(
-            file_path,
-            sizeof(file_path),
-            "%s/%s",
-            FILE_STORAGE_DIRECTORY,
-            filename
-        );
-
-
-    if (path_written < 0 ||
-        (size_t)path_written >=
-            sizeof(file_path))
-    {
-        client_manager_send(
+        return send_error(
             socket_fd,
-            MSG_ERROR,
-            "INVALID_FILE_PATH"
+            "INVALID_DOWNLOAD_FILENAME"
         );
-
-
-        return 0;
     }
 
 
-    int open_flags =
-        O_RDONLY;
-
-
-#ifdef O_NOFOLLOW
-    /*
-     * Avoid following a malicious symbolic link
-     * placed in the shared storage directory.
-     */
-    open_flags |=
-        O_NOFOLLOW;
-#endif
-
-
-    int file_fd =
-        open(
-            file_path,
-            open_flags
+    if (ensure_storage_directory() != 0)
+    {
+        logger_client_log(
+            LOG_ERROR,
+            "FILE_MANAGER",
+            "Storage directory unavailable during download error=%s",
+            strerror(errno)
         );
 
 
-    if (file_fd < 0)
+        return send_error(
+            socket_fd,
+            "STORAGE_UNAVAILABLE"
+        );
+    }
+
+
+    int lock_fd =
+        file_lock_acquire(
+            filename,
+            FILE_LOCK_SHARED
+        );
+
+
+    if (lock_fd < 0)
     {
-        if (errno == ENOENT)
-        {
-            client_manager_send(
-                socket_fd,
-                MSG_ERROR,
-                "FILE_NOT_FOUND"
-            );
-        }
-        else
-        {
-            client_manager_send(
-                socket_fd,
-                MSG_ERROR,
-                "DOWNLOAD_OPEN_FAILED"
-            );
-        }
-
-
         logger_client_log(
-            LOG_WARN,
+            LOG_ERROR,
             "FILE_MANAGER",
-            "Download open failed username=%s filename=%s error=%s",
+            "Unable to acquire download lock username=%s filename=%s error=%s",
             username,
             filename,
             strerror(errno)
         );
 
 
-        return 0;
+        return send_error(
+            socket_fd,
+            "FILE_LOCK_FAILED"
+        );
+    }
+
+
+    int result = 0;
+
+    int storage_fd = -1;
+    int file_fd = -1;
+
+
+    storage_fd =
+        open_storage_directory();
+
+
+    if (storage_fd < 0)
+    {
+        logger_client_log(
+            LOG_ERROR,
+            "SECURITY",
+            "Secure storage open failed during download error=%s",
+            strerror(errno)
+        );
+
+
+        result =
+            send_error(
+                socket_fd,
+                "STORAGE_UNAVAILABLE"
+            );
+
+
+        goto download_cleanup;
+    }
+
+
+    int open_flags =
+        O_RDONLY |
+        O_CLOEXEC;
+
+
+#ifdef O_NOFOLLOW
+    open_flags |=
+        O_NOFOLLOW;
+#endif
+
+
+    /*
+     * openat() confines lookup to the already-open
+     * storage directory. O_NOFOLLOW blocks a final
+     * symbolic-link entry.
+     */
+    file_fd =
+        openat(
+            storage_fd,
+            filename,
+            open_flags
+        );
+
+
+    if (file_fd < 0)
+    {
+        int saved_errno =
+            errno;
+
+
+        if (saved_errno == ENOENT)
+        {
+            result =
+                send_error(
+                    socket_fd,
+                    "FILE_NOT_FOUND"
+                );
+        }
+#ifdef ELOOP
+        else if (saved_errno == ELOOP)
+        {
+            logger_client_log(
+                LOG_WARN,
+                "SECURITY",
+                "Rejected symbolic-link download username=%s filename=%s",
+                username,
+                filename
+            );
+
+
+            result =
+                send_error(
+                    socket_fd,
+                    "UNSAFE_FILE_ENTRY"
+                );
+        }
+#endif
+        else
+        {
+            logger_client_log(
+                LOG_WARN,
+                "FILE_MANAGER",
+                "Download open failed username=%s filename=%s error=%s",
+                username,
+                filename,
+                strerror(saved_errno)
+            );
+
+
+            result =
+                send_error(
+                    socket_fd,
+                    "DOWNLOAD_OPEN_FAILED"
+                );
+        }
+
+
+        goto download_cleanup;
     }
 
 
@@ -851,17 +1167,14 @@ static int file_manager_handle_download_unlocked(
             &information
         ) != 0)
     {
-        close(file_fd);
+        result =
+            send_error(
+                socket_fd,
+                "DOWNLOAD_STAT_FAILED"
+            );
 
 
-        client_manager_send(
-            socket_fd,
-            MSG_ERROR,
-            "DOWNLOAD_STAT_FAILED"
-        );
-
-
-        return 0;
+        goto download_cleanup;
     }
 
 
@@ -869,33 +1182,36 @@ static int file_manager_handle_download_unlocked(
             information.st_mode
         ))
     {
-        close(file_fd);
-
-
-        client_manager_send(
-            socket_fd,
-            MSG_ERROR,
-            "NOT_A_REGULAR_FILE"
+        logger_client_log(
+            LOG_WARN,
+            "SECURITY",
+            "Rejected non-regular download username=%s filename=%s",
+            username,
+            filename
         );
 
 
-        return 0;
+        result =
+            send_error(
+                socket_fd,
+                "NOT_A_REGULAR_FILE"
+            );
+
+
+        goto download_cleanup;
     }
 
 
     if (information.st_size < 0)
     {
-        close(file_fd);
+        result =
+            send_error(
+                socket_fd,
+                "INVALID_FILE_SIZE"
+            );
 
 
-        client_manager_send(
-            socket_fd,
-            MSG_ERROR,
-            "INVALID_FILE_SIZE"
-        );
-
-
-        return 0;
+        goto download_cleanup;
     }
 
 
@@ -906,101 +1222,77 @@ static int file_manager_handle_download_unlocked(
     if (file_size >
         FILE_MAX_SIZE)
     {
-        close(file_fd);
+        result =
+            send_error(
+                socket_fd,
+                "FILE_TOO_LARGE"
+            );
 
 
-        client_manager_send(
-            socket_fd,
-            MSG_ERROR,
-            "FILE_TOO_LARGE"
-        );
-
-
-        return 0;
+        goto download_cleanup;
     }
 
 
-    /*
-     * Metadata format:
-     *
-     * DOWNLOAD_READY filename|size
-     */
-    char metadata[
+    char response[
         MESSAGE_MAX_SIZE + 1
     ];
 
 
-    int metadata_written =
+    int response_written =
         snprintf(
-            metadata,
-            sizeof(metadata),
+            response,
+            sizeof(response),
             "DOWNLOAD_READY %s|%" PRIu64,
             filename,
             file_size
         );
 
 
-    if (metadata_written < 0 ||
-        (size_t)metadata_written >=
-            sizeof(metadata))
+    if (response_written < 0 ||
+        (size_t)response_written >=
+            sizeof(response))
     {
-        close(file_fd);
+        result =
+            send_error(
+                socket_fd,
+                "DOWNLOAD_METADATA_FAILED"
+            );
 
 
-        client_manager_send(
-            socket_fd,
-            MSG_ERROR,
-            "DOWNLOAD_METADATA_FAILED"
-        );
-
-
-        return 0;
+        goto download_cleanup;
     }
 
 
     /*
-     * This function serializes the metadata frame and
-     * the complete binary file stream using the
-     * destination client's send mutex.
+     * client_manager_send_file_stream() holds the
+     * destination client's send mutex for the metadata
+     * frame plus every promised raw byte.
      */
-    int send_result =
-        client_manager_send_file_stream(
+    if (client_manager_send_file_stream(
             socket_fd,
             MSG_RESPONSE,
-            metadata,
+            response,
             file_fd,
             file_size
-        );
-
-
-    if (close(
-            file_fd
         ) != 0)
     {
         logger_client_log(
             LOG_WARN,
             "FILE_MANAGER",
-            "Failed closing downloaded source filename=%s",
-            filename
-        );
-    }
-
-
-    if (send_result != 0)
-    {
-        logger_client_log(
-            LOG_WARN,
-            "FILE_MANAGER",
-            "Download interrupted username=%s filename=%s",
+            "Download stream failed username=%s filename=%s",
             username,
             filename
         );
 
 
         /*
-         * The stream may now be incomplete.
+         * A partial raw stream is not recoverable as an
+         * application-frame stream. Force connection
+         * teardown in the handler.
          */
-        return -1;
+        result = -1;
+
+        goto download_cleanup;
     }
 
 
@@ -1014,82 +1306,38 @@ static int file_manager_handle_download_unlocked(
     );
 
 
-    return 0;
-}
+download_cleanup:
 
-int file_manager_handle_download(
-    int socket_fd,
-    const char *username,
-    const char *filename
-)
-{
-    if (filename == NULL ||
-        !is_valid_shared_filename(
-            filename
-        ))
+    if (file_fd >= 0)
     {
-        return file_manager_handle_download_unlocked(
-            socket_fd,
-            username,
-            filename
-        );
+        if (close(
+                file_fd
+            ) != 0)
+        {
+            logger_client_log(
+                LOG_WARN,
+                "FILE_MANAGER",
+                "Failed closing download source filename=%s",
+                filename
+            );
+        }
     }
 
-    if (ensure_storage_directory() != 0)
+
+    if (storage_fd >= 0)
     {
-        client_manager_send(
-            socket_fd,
-            MSG_ERROR,
-            "STORAGE_UNAVAILABLE"
-        );
-
-        logger_client_log(
-            LOG_ERROR,
-            "FILE_MANAGER",
-            "Storage directory unavailable during download"
-        );
-
-        return 0;
+        if (close(
+                storage_fd
+            ) != 0)
+        {
+            logger_client_log(
+                LOG_WARN,
+                "FILE_MANAGER",
+                "Storage directory close failed after download"
+            );
+        }
     }
 
-    /*
-     * Readers use a shared OFD lock. Multiple
-     * downloads of the same file may proceed together,
-     * while an upload/writer for the same filename
-     * must wait.
-     */
-    int lock_fd =
-        file_lock_acquire(
-            filename,
-            FILE_LOCK_SHARED
-        );
-
-    if (lock_fd < 0)
-    {
-        client_manager_send(
-            socket_fd,
-            MSG_ERROR,
-            "FILE_LOCK_FAILED"
-        );
-
-        logger_client_log(
-            LOG_ERROR,
-            "FILE_MANAGER",
-            "Unable to acquire download lock username=%s filename=%s error=%s",
-            username,
-            filename,
-            strerror(errno)
-        );
-
-        return 0;
-    }
-
-    int result =
-        file_manager_handle_download_unlocked(
-            socket_fd,
-            username,
-            filename
-        );
 
     if (file_lock_release(
             lock_fd
@@ -1103,6 +1351,7 @@ int file_manager_handle_download(
             filename
         );
     }
+
 
     return result;
 }
@@ -1118,60 +1367,68 @@ int file_manager_handle_list(
         return -1;
     }
 
+
     if (ensure_storage_directory() != 0)
     {
-        client_manager_send(
+        return send_error(
             socket_fd,
-            MSG_ERROR,
             "STORAGE_UNAVAILABLE"
         );
-
-        return 0;
     }
 
+
     int directory_fd =
-        open(
-            FILE_STORAGE_DIRECTORY,
-            O_RDONLY |
-            O_DIRECTORY |
-            O_CLOEXEC
-        );
+        open_storage_directory();
+
 
     if (directory_fd < 0)
     {
-        client_manager_send(
-            socket_fd,
-            MSG_ERROR,
-            "FILE_LIST_OPEN_FAILED"
-        );
-
         logger_client_log(
             LOG_ERROR,
-            "FILE_MANAGER",
-            "Unable to open storage directory for listing error=%s",
+            "SECURITY",
+            "Secure storage open failed during listing error=%s",
             strerror(errno)
         );
 
-        return 0;
+
+        return send_error(
+            socket_fd,
+            "FILE_LIST_OPEN_FAILED"
+        );
     }
+
 
     DIR *directory =
         fdopendir(
             directory_fd
         );
 
+
     if (directory == NULL)
     {
+        int saved_errno =
+            errno;
+
+
         close(directory_fd);
 
-        client_manager_send(
+
+        errno =
+            saved_errno;
+
+
+        return send_error(
             socket_fd,
-            MSG_ERROR,
             "FILE_LIST_OPEN_FAILED"
         );
-
-        return 0;
     }
+
+
+    /*
+     * fdopendir() owns directory_fd from this point.
+     */
+    directory_fd = -1;
+
 
     if (client_manager_send(
             socket_fd,
@@ -1184,15 +1441,21 @@ int file_manager_handle_list(
         return -1;
     }
 
+
     int file_count = 0;
     int list_failed = 0;
 
+
     errno = 0;
+
 
     while (1)
     {
         struct dirent *entry =
-            readdir(directory);
+            readdir(
+                directory
+            );
+
 
         if (entry == NULL)
         {
@@ -1201,13 +1464,14 @@ int file_manager_handle_list(
                 list_failed = 1;
             }
 
+
             break;
         }
 
+
         /*
-         * Filename validation automatically excludes
-         * .gitkeep, .locks, upload temporary files,
-         * traversal-like names, and unsupported names.
+         * This rejects internal/hidden names and every
+         * filename outside SyncChat's basename policy.
          */
         if (!is_valid_shared_filename(
                 entry->d_name
@@ -1216,18 +1480,31 @@ int file_manager_handle_list(
             continue;
         }
 
+
         struct stat information;
 
+
         if (fstatat(
-                directory_fd,
+                dirfd(directory),
                 entry->d_name,
                 &information,
                 AT_SYMLINK_NOFOLLOW
             ) != 0)
         {
+            /*
+             * The entry may have disappeared between
+             * readdir() and fstatat(). Skip it rather
+             * than failing the entire listing.
+             */
             continue;
         }
 
+
+        /*
+         * Symbolic links, directories, sockets, FIFOs,
+         * devices, and other non-regular entries are not
+         * advertised to clients.
+         */
         if (!S_ISREG(
                 information.st_mode
             ) ||
@@ -1236,8 +1513,10 @@ int file_manager_handle_list(
             continue;
         }
 
+
         uint64_t file_size =
             (uint64_t)information.st_size;
+
 
         if (file_size >
             FILE_MAX_SIZE)
@@ -1245,9 +1524,11 @@ int file_manager_handle_list(
             continue;
         }
 
+
         char file_entry[
             FILE_NAME_MAX_SIZE + 64
         ];
+
 
         int written =
             snprintf(
@@ -1258,12 +1539,14 @@ int file_manager_handle_list(
                 file_size
             );
 
+
         if (written < 0 ||
             (size_t)written >=
                 sizeof(file_entry))
         {
             continue;
         }
+
 
         if (client_manager_send(
                 socket_fd,
@@ -1276,8 +1559,10 @@ int file_manager_handle_list(
             return -1;
         }
 
+
         file_count++;
     }
+
 
     if (closedir(
             directory
@@ -1286,17 +1571,9 @@ int file_manager_handle_list(
         list_failed = 1;
     }
 
+
     if (list_failed)
     {
-        if (client_manager_send(
-                socket_fd,
-                MSG_ERROR,
-                "FILE_LIST_READ_FAILED"
-            ) != 0)
-        {
-            return -1;
-        }
-
         logger_client_log(
             LOG_ERROR,
             "FILE_MANAGER",
@@ -1304,10 +1581,16 @@ int file_manager_handle_list(
             username
         );
 
-        return 0;
+
+        return send_error(
+            socket_fd,
+            "FILE_LIST_READ_FAILED"
+        );
     }
 
+
     char end_message[64];
+
 
     int end_written =
         snprintf(
@@ -1317,12 +1600,14 @@ int file_manager_handle_list(
             file_count
         );
 
+
     if (end_written < 0 ||
         (size_t)end_written >=
             sizeof(end_message))
     {
         return -1;
     }
+
 
     if (client_manager_send(
             socket_fd,
@@ -1333,6 +1618,7 @@ int file_manager_handle_list(
         return -1;
     }
 
+
     logger_client_log(
         LOG_DEBUG,
         "FILE_MANAGER",
@@ -1340,6 +1626,7 @@ int file_manager_handle_list(
         username,
         file_count
     );
+
 
     return 0;
 }

@@ -23,9 +23,11 @@
 #error "SyncChat requires Linux open-file-description fcntl locks"
 #endif
 
+
 static int ensure_lock_directory(void)
 {
     struct stat information;
+
 
     if (mkdir(
             FILE_LOCK_DIRECTORY,
@@ -35,18 +37,27 @@ static int ensure_lock_directory(void)
         return 0;
     }
 
+
     if (errno != EEXIST)
     {
         return -1;
     }
 
-    if (stat(
+
+    /*
+     * lstat() deliberately does not follow a symbolic
+     * link. The internal lock directory itself must be
+     * a real directory owned by the SyncChat storage
+     * layout.
+     */
+    if (lstat(
             FILE_LOCK_DIRECTORY,
             &information
         ) != 0)
     {
         return -1;
     }
+
 
     if (!S_ISDIR(
             information.st_mode
@@ -57,8 +68,31 @@ static int ensure_lock_directory(void)
         return -1;
     }
 
+
     return 0;
 }
+
+
+static int open_lock_directory(void)
+{
+    int flags =
+        O_RDONLY |
+        O_DIRECTORY |
+        O_CLOEXEC;
+
+
+#ifdef O_NOFOLLOW
+    flags |=
+        O_NOFOLLOW;
+#endif
+
+
+    return open(
+        FILE_LOCK_DIRECTORY,
+        flags
+    );
+}
+
 
 int file_lock_acquire(
     const char *filename,
@@ -66,12 +100,15 @@ int file_lock_acquire(
 )
 {
     if (filename == NULL ||
-        !is_valid_shared_filename(filename))
+        !is_valid_shared_filename(
+            filename
+        ))
     {
         errno = EINVAL;
 
         return -1;
     }
+
 
     if (mode != FILE_LOCK_SHARED &&
         mode != FILE_LOCK_EXCLUSIVE)
@@ -81,62 +118,138 @@ int file_lock_acquire(
         return -1;
     }
 
+
     if (ensure_lock_directory() != 0)
     {
         return -1;
     }
 
-    char lock_path[
-        PATH_MAX
+
+    int directory_fd =
+        open_lock_directory();
+
+
+    if (directory_fd < 0)
+    {
+        return -1;
+    }
+
+
+    char lock_name[
+        FILE_NAME_MAX_SIZE + 8
     ];
 
-    int path_written =
+
+    int name_written =
         snprintf(
-            lock_path,
-            sizeof(lock_path),
-            "%s/%s.lock",
-            FILE_LOCK_DIRECTORY,
+            lock_name,
+            sizeof(lock_name),
+            "%s.lock",
             filename
         );
 
-    if (path_written < 0 ||
-        (size_t)path_written >=
-            sizeof(lock_path))
+
+    if (name_written < 0 ||
+        (size_t)name_written >=
+            sizeof(lock_name))
     {
+        close(directory_fd);
+
         errno = ENAMETOOLONG;
 
         return -1;
     }
+
 
     int open_flags =
         O_RDWR |
         O_CREAT |
         O_CLOEXEC;
 
+
 #ifdef O_NOFOLLOW
     open_flags |=
         O_NOFOLLOW;
 #endif
 
+
+    /*
+     * openat() keeps the lock-file lookup confined to
+     * the already-open .locks directory.
+     */
     int lock_fd =
-        open(
-            lock_path,
+        openat(
+            directory_fd,
+            lock_name,
             open_flags,
             0600
         );
 
-    if (lock_fd < 0)
+
+    int saved_errno =
+        errno;
+
+
+    if (close(
+            directory_fd
+        ) != 0 &&
+        lock_fd >= 0)
     {
+        close(lock_fd);
+
         return -1;
     }
 
+
+    if (lock_fd < 0)
+    {
+        errno =
+            saved_errno;
+
+        return -1;
+    }
+
+
+    struct stat information;
+
+
+    if (fstat(
+            lock_fd,
+            &information
+        ) != 0 ||
+        !S_ISREG(
+            information.st_mode
+        ))
+    {
+        saved_errno =
+            errno;
+
+
+        if (saved_errno == 0)
+        {
+            saved_errno =
+                EINVAL;
+        }
+
+
+        close(lock_fd);
+
+        errno =
+            saved_errno;
+
+        return -1;
+    }
+
+
     struct flock lock;
+
 
     memset(
         &lock,
         0,
         sizeof(lock)
     );
+
 
     lock.l_type =
         mode == FILE_LOCK_SHARED
@@ -149,6 +262,7 @@ int file_lock_acquire(
     lock.l_start = 0;
     lock.l_len = 0;
 
+
     while (fcntl(
             lock_fd,
             F_OFD_SETLKW,
@@ -160,19 +274,25 @@ int file_lock_acquire(
             continue;
         }
 
-        int saved_errno =
+
+        saved_errno =
             errno;
 
+
         close(lock_fd);
+
 
         errno =
             saved_errno;
 
+
         return -1;
     }
 
+
     return lock_fd;
 }
+
 
 int file_lock_release(
     int lock_fd
@@ -185,13 +305,16 @@ int file_lock_release(
         return -1;
     }
 
+
     struct flock lock;
+
 
     memset(
         &lock,
         0,
         sizeof(lock)
     );
+
 
     lock.l_type =
         F_UNLCK;
@@ -202,7 +325,9 @@ int file_lock_release(
     lock.l_start = 0;
     lock.l_len = 0;
 
+
     int unlock_result;
+
 
     do
     {
@@ -216,11 +341,16 @@ int file_lock_release(
     while (unlock_result != 0 &&
            errno == EINTR);
 
+
     int saved_errno =
         errno;
 
+
     int close_result =
-        close(lock_fd);
+        close(
+            lock_fd
+        );
+
 
     if (unlock_result != 0)
     {
@@ -230,10 +360,12 @@ int file_lock_release(
         return -1;
     }
 
+
     if (close_result != 0)
     {
         return -1;
     }
+
 
     return 0;
 }
