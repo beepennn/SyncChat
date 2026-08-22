@@ -17,6 +17,7 @@ LOGGER_CLIENT_SRC = src/logger/logger_client.c
 NETWORK_IO_SRC = src/common/network_io.c
 PROTOCOL_SRC = src/common/protocol.c
 FILE_TRANSFER_SRC = src/common/file_transfer.c
+PERFORMANCE_TIMER_SRC = src/common/performance_timer.c
 
 CLIENT_MANAGER_SRC = src/server/client_manager.c
 FILE_MANAGER_SRC = src/server/file_manager.c
@@ -35,7 +36,8 @@ SERVER_SRC = \
 	$(LOGGER_CLIENT_SRC) \
 	$(NETWORK_IO_SRC) \
 	$(PROTOCOL_SRC) \
-	$(FILE_TRANSFER_SRC)
+	$(FILE_TRANSFER_SRC) \
+	$(PERFORMANCE_TIMER_SRC)
 
 CLIENT_SRC = \
 	src/client/main.c \
@@ -67,6 +69,7 @@ $(SERVER): $(SERVER_SRC) \
 	include/common/network_io.h \
 	include/common/protocol.h \
 	include/common/file_transfer.h \
+	include/common/performance_timer.h \
 	include/logger/logger_protocol.h \
 	include/logger/logger_client.h \
 	include/server/server_config.h \

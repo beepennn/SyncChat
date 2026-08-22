@@ -13,6 +13,7 @@
 
 #include "common/file_transfer.h"
 #include "common/network_io.h"
+#include "common/performance_timer.h"
 #include "common/protocol.h"
 #include "logger/logger_client.h"
 #include "server/client_manager.h"
@@ -456,6 +457,12 @@ int file_manager_handle_upload(
 
     int temp_created = 0;
 
+    performance_timer_t transfer_timer;
+
+    int transfer_timer_started = 0;
+
+    double transfer_seconds = 0.0;
+
 
     char temporary_name[
         FILE_NAME_MAX_SIZE
@@ -646,6 +653,29 @@ int file_manager_handle_upload(
     }
 
 
+    /*
+     * Measure the raw client-to-server transfer with a
+     * monotonic clock. Timer failure must never break a
+     * valid file transfer.
+     */
+    if (performance_timer_start(
+            &transfer_timer
+        ) == 0)
+    {
+        transfer_timer_started = 1;
+    }
+    else
+    {
+        logger_client_log(
+            LOG_WARN,
+            "PERFORMANCE",
+            "Unable to start upload timer username=%s filename=%s",
+            username,
+            filename
+        );
+    }
+
+
     unsigned char buffer[
         FILE_CHUNK_SIZE
     ];
@@ -725,6 +755,47 @@ int file_manager_handle_upload(
 
         remaining -=
             (uint64_t)chunk_size;
+    }
+
+
+    if (transfer_timer_started)
+    {
+        if (performance_timer_stop(
+                &transfer_timer,
+                &transfer_seconds
+            ) == 0)
+        {
+            double throughput_mib_s =
+                performance_timer_mib_per_second(
+                    file_size,
+                    transfer_seconds
+                );
+
+
+            logger_client_log(
+                LOG_INFO,
+                "PERFORMANCE",
+                "UPLOAD username=%s filename=%s bytes=%" PRIu64 " seconds=%.6f throughput_mib_s=%.3f",
+                username,
+                filename,
+                file_size,
+                transfer_seconds,
+                throughput_mib_s
+            );
+        }
+        else
+        {
+            logger_client_log(
+                LOG_WARN,
+                "PERFORMANCE",
+                "Unable to stop upload timer username=%s filename=%s",
+                username,
+                filename
+            );
+        }
+
+
+        transfer_timer_started = 0;
     }
 
 
@@ -902,6 +973,29 @@ int file_manager_handle_upload(
 
 upload_cleanup:
 
+    if (transfer_timer_started)
+    {
+        if (performance_timer_stop(
+                &transfer_timer,
+                &transfer_seconds
+            ) == 0)
+        {
+            logger_client_log(
+                LOG_WARN,
+                "PERFORMANCE",
+                "UPLOAD_ABORTED username=%s filename=%s expected_bytes=%" PRIu64 " seconds=%.6f",
+                username,
+                filename,
+                file_size,
+                transfer_seconds
+            );
+        }
+
+
+        transfer_timer_started = 0;
+    }
+
+
     if (file_fd >= 0)
     {
         if (close(
@@ -1051,6 +1145,12 @@ int file_manager_handle_download(
 
     int storage_fd = -1;
     int file_fd = -1;
+
+    performance_timer_t transfer_timer;
+
+    int transfer_timer_started = 0;
+
+    double transfer_seconds = 0.0;
 
 
     storage_fd =
@@ -1267,14 +1367,96 @@ int file_manager_handle_download(
      * client_manager_send_file_stream() holds the
      * destination client's send mutex for the metadata
      * frame plus every promised raw byte.
+     *
+     * The measured download duration therefore represents
+     * the server-side service time for the complete
+     * DOWNLOAD_READY frame plus binary stream.
      */
-    if (client_manager_send_file_stream(
+    if (performance_timer_start(
+            &transfer_timer
+        ) == 0)
+    {
+        transfer_timer_started = 1;
+    }
+    else
+    {
+        logger_client_log(
+            LOG_WARN,
+            "PERFORMANCE",
+            "Unable to start download timer username=%s filename=%s",
+            username,
+            filename
+        );
+    }
+
+
+    int stream_result =
+        client_manager_send_file_stream(
             socket_fd,
             MSG_RESPONSE,
             response,
             file_fd,
             file_size
-        ) != 0)
+        );
+
+
+    if (transfer_timer_started)
+    {
+        if (performance_timer_stop(
+                &transfer_timer,
+                &transfer_seconds
+            ) == 0)
+        {
+            if (stream_result == 0)
+            {
+                double throughput_mib_s =
+                    performance_timer_mib_per_second(
+                        file_size,
+                        transfer_seconds
+                    );
+
+
+                logger_client_log(
+                    LOG_INFO,
+                    "PERFORMANCE",
+                    "DOWNLOAD username=%s filename=%s bytes=%" PRIu64 " seconds=%.6f throughput_mib_s=%.3f",
+                    username,
+                    filename,
+                    file_size,
+                    transfer_seconds,
+                    throughput_mib_s
+                );
+            }
+            else
+            {
+                logger_client_log(
+                    LOG_WARN,
+                    "PERFORMANCE",
+                    "DOWNLOAD_ABORTED username=%s filename=%s expected_bytes=%" PRIu64 " seconds=%.6f",
+                    username,
+                    filename,
+                    file_size,
+                    transfer_seconds
+                );
+            }
+        }
+        else
+        {
+            logger_client_log(
+                LOG_WARN,
+                "PERFORMANCE",
+                "Unable to stop download timer username=%s filename=%s",
+                username,
+                filename
+            );
+        }
+
+
+        transfer_timer_started = 0;
+    }
+
+
+    if (stream_result != 0)
     {
         logger_client_log(
             LOG_WARN,
